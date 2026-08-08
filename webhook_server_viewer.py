@@ -1,6 +1,11 @@
 import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html
 from datetime import datetime, timezone
 from flask import Flask, request, Response, redirect
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 
 app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN','')
@@ -8,9 +13,19 @@ META_ACCESS_TOKEN = os.environ.get('META_ACCESS_TOKEN','')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID','1190081650863434')
 GRAPH_API_VERSION = os.environ.get('GRAPH_API_VERSION','v23.0')
 DB_PATH = os.environ.get('DB_PATH','conversations.db')
+DATABASE_URL = os.environ.get('DATABASE_URL','').strip()
 DASHBOARD_USER = os.environ.get('DASHBOARD_USER','admin')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD','')
 conversations = {}
+
+class PGConnection:
+    def __init__(self, url):
+        self.conn=psycopg2.connect(url, connect_timeout=10)
+        self.cur=self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def execute(self, query, params=()):
+        return self.cur.execute(query.replace('?', '%s'), params)
+    def commit(self): self.conn.commit()
+    def close(self): self.cur.close(); self.conn.close()
 WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜\n\n'
            '¿En qué podemos ayudarte?\n'
            '1️⃣ Solicitar cotización de alquiler\n'
@@ -18,6 +33,10 @@ WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜\n\n'
            '3️⃣ Hablar con un asesor')
 
 def db():
+    if DATABASE_URL and psycopg2:
+        c=PGConnection(DATABASE_URL)
+        c.execute('CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)')
+        c.commit(); return c
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
     c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)'); c.commit(); return c
 
