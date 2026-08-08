@@ -23,7 +23,8 @@ class PGConnection:
         self.conn=psycopg2.connect(url, connect_timeout=10)
         self.cur=self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     def execute(self, query, params=()):
-        return self.cur.execute(query.replace('?', '%s'), params)
+        self.cur.execute(query.replace('?', '%s'), params)
+        return self.cur
     def commit(self): self.conn.commit()
     def close(self): self.cur.close(); self.conn.close()
 WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜\n\n'
