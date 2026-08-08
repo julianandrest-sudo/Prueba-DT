@@ -1,4 +1,4 @@
-import os, json, base64, sqlite3, urllib.request, urllib.error
+import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html
 from datetime import datetime, timezone
 from flask import Flask, request, Response, redirect
 
@@ -84,11 +84,34 @@ def webhook():
     except Exception as e: print('Error procesando:',e,flush=True)
     return 'EVENT_RECEIVED',200
 
+@app.get('/dashboard/export.csv')
+def export_csv():
+    if not authorized(request): return login()
+    c=db(); rows=c.execute('SELECT id,sender,direction,body,created_at FROM messages ORDER BY id').fetchall(); c.close()
+    buf=io.StringIO(); writer=csv.writer(buf); writer.writerow(['ID','Cliente','Dirección','Mensaje','Fecha y hora'])
+    for r in rows: writer.writerow([r['id'],r['sender'],'Entrante' if r['direction']=='in' else 'Saliente',r['body'],r['created_at']])
+    data='\\ufeff'+buf.getvalue()
+    return Response(data, mimetype='text/csv; charset=utf-8', headers={'Content-Disposition':'attachment; filename=dt_gruas_respaldo_conversaciones.csv'})
+
+@app.get('/dashboard/print')
+def print_all():
+    if not authorized(request): return login()
+    c=db(); rows=c.execute('SELECT sender,direction,body,created_at FROM messages ORDER BY id').fetchall(); c.close()
+    out=['<!doctype html><meta charset="utf-8"><title>Respaldo de conversaciones - DT Grúas</title><style>body{font-family:Arial;margin:28px}.toolbar{margin-bottom:20px}button{padding:10px 16px}.msg{padding:8px;margin:6px 0;border-radius:6px;white-space:pre-wrap}.in{background:#eee}.out{background:#d9fdd3}</style><div class="toolbar"><button onclick="window.print()">Imprimir / Guardar como PDF</button> <a href="/dashboard">Volver al visor</a></div><h1>Respaldo de conversaciones</h1><p>Generado: '+html.escape(datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'))+'</p>']
+    current=None
+    for r in rows:
+        if r['sender']!=current:
+            current=r['sender']; out.append('<hr><h2>Cliente: '+html.escape(r['sender'])+'</h2>')
+        cls='in' if r['direction']=='in' else 'out'; label='Entrante' if cls=='in' else 'Saliente'
+        out.append(f'<div class="msg {cls}"><b>{label}</b> · {html.escape(r["created_at"])}<br>{html.escape(r["body"])}</div>')
+    if not rows: out.append('<p>No hay mensajes todavía.</p>')
+    return ''.join(out)
+
 @app.get('/dashboard')
 def dashboard():
     if not authorized(request): return login()
     c=db(); rows=c.execute('SELECT sender,MAX(created_at) last_time,COUNT(*) total FROM messages GROUP BY sender ORDER BY last_time DESC').fetchall(); c.close()
-    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p>']
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><div class="actions"><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
     if not rows: out.append('<div class="card">No hay mensajes todavía.</div>')
     for r in rows: out.append(f'<div class="card"><a href="/dashboard/{r["sender"]}"><b>{r["sender"]}</b></a><br>{r["total"]} mensajes · {r["last_time"]}</div>')
     return ''.join(out)
@@ -101,8 +124,9 @@ def chat(sender):
         if text: send_text(sender,text)
         return redirect('/dashboard/'+sender)
     c=db(); rows=c.execute('SELECT direction,body,created_at FROM messages WHERE sender=? ORDER BY id',(sender,)).fetchall(); c.close()
-    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}</style><a href="/dashboard">← Conversaciones</a><h2>{sender}</h2>']
-    for r in rows: out.append(f'<div class="{r["direction"]}"><small>{r["created_at"]}</small><br>{r["body"]}</div>')
+    safe_sender=html.escape(sender)
+    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a>']
+    for r in rows: out.append(f'<div class="{r["direction"]}"><small>{html.escape(r["created_at"])}</small><br>{html.escape(r["body"])}</div>')
     out.append('<form method="post"><textarea name="text" placeholder="Escribir respuesta..."></textarea><button>Enviar</button></form>'); return ''.join(out)
 
 @app.get('/')
