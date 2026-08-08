@@ -11,6 +11,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN','')
 META_ACCESS_TOKEN = os.environ.get('META_ACCESS_TOKEN','')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID','1190081650863434')
+ADMIN_PHONE = os.environ.get('ADMIN_PHONE','573012108712')
 GRAPH_API_VERSION = os.environ.get('GRAPH_API_VERSION','v23.0')
 DB_PATH = os.environ.get('DB_PATH','conversations.db')
 DATABASE_URL = os.environ.get('DATABASE_URL','').strip()
@@ -68,6 +69,17 @@ def send_text(to,text):
     except Exception as e: print('Error enviando',e,flush=True)
     return False
 
+def send_admin_alert(text):
+    if not META_ACCESS_TOKEN or not ADMIN_PHONE: return False
+    url=f'https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages'
+    payload=json.dumps({'messaging_product':'whatsapp','to':ADMIN_PHONE,'type':'text','text':{'preview_url':False,'body':text}}).encode()
+    req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=15) as r: print('Alerta enviada',r.status,flush=True)
+        return True
+    except Exception as e: print('Error alerta:',e,flush=True)
+    return False
+
 def process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
     if low in {'hola','buenas','inicio','menu','menú','0','reiniciar'}: s.update(step='menu',data={}); return WELCOME
@@ -100,7 +112,17 @@ def webhook():
                 for m in change.get('value',{}).get('messages',[]):
                     sender=m.get('from')
                     if sender and m.get('type')=='text':
-                        text=m.get('text',{}).get('body',''); save(sender,'in',text); send_text(sender,process(sender,text))
+                        text=m.get('text',{}).get('body',''); save(sender,'in',text)
+                        reply=process(sender,text); send_text(sender,reply)
+                        state=conversations.get(sender,{})
+                        urgent=any(x in text.lower() for x in ('urgente','ya','hoy','parado','no funciona','emergencia'))
+                        qualified=state.get('step') in ('done','advisor')
+                        if sender != ADMIN_PHONE and (urgent or qualified):
+                            alert=('🚨 ALERTA DT GRÚAS\\n\\nCliente: '+sender+'\\n'
+                                   +'Motivo: '+('Solicitud urgente' if urgent else 'Nueva solicitud comercial')+'\\n'
+                                   +'Último mensaje: '+text+'\\n\\n'
+                                   +'Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
+                            send_admin_alert(alert)
     except Exception as e: print('Error procesando:',e,flush=True)
     return 'EVENT_RECEIVED',200
 
