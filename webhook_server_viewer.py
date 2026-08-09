@@ -28,11 +28,14 @@ class PGConnection:
         return self.cur
     def commit(self): self.conn.commit()
     def close(self): self.cur.close(); self.conn.close()
-WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜\n\n'
+WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜🏗️\n\n'
            '¿En qué podemos ayudarte?\n'
-           '1️⃣ Solicitar cotización de alquiler\n'
-           '2️⃣ Mantenimiento o reparación\n'
-           '3️⃣ Hablar con un asesor')
+           '1️⃣ Alquiler de montacargas\n'
+           '2️⃣ Alquiler de grúas\n'
+           '3️⃣ Mantenimiento o reparación\n'
+           '4️⃣ Venta de equipos o repuestos\n'
+           '5️⃣ Solicitar visita técnica\n'
+           '6️⃣ Hablar con un asesor')
 
 def db():
     if DATABASE_URL and psycopg2:
@@ -83,20 +86,50 @@ def send_admin_alert(text):
 
 def process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
-    if low in {'hola','buenas','inicio','menu','menú','0','reiniciar'}: s.update(step='menu',data={}); return WELCOME
+    if low in {'hola','buenas','inicio','menu','menú','0','reiniciar'}:
+        s.update(step='menu',data={}); return WELCOME
+    if low in {'asesor','persona','humano'}:
+        s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
     if s['step']=='menu':
-        if text=='1' or 'cotizar' in low or 'alquiler' in low: s['step']='equipment'; return 'Perfecto. ¿Qué equipo necesitas alquilar y para qué tipo de trabajo?'
-        if text=='2' or 'mantenimiento' in low or 'reparación' in low or 'reparacion' in low: s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
-        if text=='3' or 'asesor' in low or 'persona' in low: s['step']='advisor'; return 'Claro. Déjanos tu nombre y un asesor te contactará lo antes posible.'
-        return 'Por favor responde con 1, 2 o 3.\n\n'+WELCOME
-    if s['step']=='equipment': s['data']['equipment']=text; s['step']='location'; return '¿En qué ciudad o dirección se utilizaría el montacargas?'
-    if s['step']=='location': s['data']['location']=text; s['step']='dates'; return '¿Para qué fecha y por cuánto tiempo lo necesitas?'
-    if s['step']=='dates': s['data']['dates']=text; s['step']='contact'; return 'Gracias. ¿Cuál es tu nombre y empresa para preparar la cotización?'
+        if text=='1' or 'montacarga' in low:
+            s.update(step='rental_equipment',data={'service':'Alquiler de montacargas'})
+            return 'Perfecto. ¿Qué capacidad y altura de elevación necesitas?'
+        if text=='2' or ('alquiler' in low and 'grúa' in low) or ('alquiler' in low and 'grua' in low):
+            s.update(step='rental_equipment',data={'service':'Alquiler de grúas'})
+            return 'Perfecto. ¿Qué tipo de grúa, capacidad y altura de trabajo necesitas?'
+        if text=='3' or 'mantenimiento' in low or 'reparación' in low or 'reparacion' in low:
+            s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
+        if text=='4' or 'venta' in low or 'repuesto' in low:
+            s['step']='sale'; return '¿Qué equipo o repuesto buscas? Indícanos la marca o referencia, si la conoces.'
+        if text=='5' or 'visita' in low:
+            s['step']='visit'; return '¿En qué ciudad o dirección necesitas la visita técnica y qué equipo revisaremos?'
+        if text=='6' or 'asesor' in low or 'persona' in low: s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
+        return 'Por favor responde con un número del 1 al 6.\n\n'+WELCOME
+    if s['step']=='rental_equipment':
+        s['data']['equipment_details']=text; s['step']='work'; return '¿Qué tipo de trabajo realizarás y en qué ciudad o dirección?'
+    if s['step']=='work':
+        s['data']['work_location']=text; s['step']='dates'; return '¿Para qué fecha inicia y por cuánto tiempo necesitas el alquiler? ¿Requieres operador?'
+    if s['step']=='dates':
+        s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Si aplica, puedes enviar fotos o videos del trabajo.'
     if s['step']=='contact':
         s['data']['contact']=text; d=s['data']; s['step']='done'
-        return f"✅ Recibimos tu solicitud de cotización.\n\nEquipo: {d['equipment']}\nUbicación: {d['location']}\nFecha/duración: {d['dates']}\nCliente: {d['contact']}\n\nUn asesor de DT Grúas y Montacargas revisará la información y te contactará."
-    if s['step']=='service': s['data']['service']=text; s['step']='contact'; return '¿Cuál es tu nombre y empresa? Un asesor revisará el caso y te contactará.'
-    if s['step']=='advisor': s['data']['contact']=text; s['step']='done'; return 'Gracias. Un asesor de DT Grúas y Montacargas te contactará pronto.'
+        if d.get('service'):
+            detail=(f"Detalle: {d.get('equipment_details','')}\nTrabajo y ubicación: {d.get('work_location','')}\nFecha, duración y operador: {d.get('dates_operator','')}" )
+        elif d.get('service_details'):
+            detail='Caso: '+d['service_details']
+        elif d.get('sale_details'):
+            detail='Solicitud: '+d['sale_details']
+        else:
+            detail='Visita: '+d.get('visit_details','')
+        return f"✅ Recibimos tu solicitud.\n\n{detail}\nCliente: {d['contact']}\n\nUn asesor de DT Grúas y Montacargas revisará la información y te contactará."
+    if s['step']=='service':
+        s['data']['service_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono? Puedes enviar fotos o videos de la falla.'
+    if s['step']=='sale':
+        s['data']['sale_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono para enviarte disponibilidad y precio?'
+    if s['step']=='visit':
+        s['data']['visit_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono para coordinar la visita?'
+    if s['step']=='advisor':
+        s['data']['contact']=text; s['step']='done'; return 'Gracias. Un asesor de DT Grúas y Montacargas te contactará pronto.'
     return 'Escribe hola para volver al menú principal.'
 
 @app.get('/webhook')
