@@ -106,9 +106,10 @@ def process(sender,text):
         if text=='6' or 'asesor' in low or 'persona' in low: s['data']['service']='Asesor humano'; s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
         return 'Por favor responde con un número del 1 al 6.\n\n'+WELCOME
     if s['step']=='rental_equipment':
-        s['data']['equipment_details']=text; s['step']='work'
+        s['data']['equipment_details']=text
         if s['data'].get('service')=='Alquiler de grúa tipo planchón':
-            return '¿Para qué fecha y hora necesitas el servicio?'
+            s['step']='dates'; return '¿Para qué fecha y hora necesitas el servicio?'
+        s['step']='work'
         return '¿Qué tipo de trabajo realizarás y en qué ciudad o dirección?'
     if s['step']=='work':
         s['data']['work_location']=text
@@ -120,7 +121,10 @@ def process(sender,text):
     if s['step']=='contact':
         s['data']['contact']=text; d=s['data']; s['step']='done'
         if d.get('service'):
-            detail=(f"Detalle: {d.get('equipment_details','')}\nTrabajo y ubicación: {d.get('work_location','')}\nFecha, duración y operador: {d.get('dates_operator','')}" )
+            if d.get('service')=='Alquiler de grúa tipo planchón':
+                detail=(f"Vehículo/equipo, recogida y destino: {d.get('equipment_details','')}\nFecha y hora: {d.get('dates_operator','')}" )
+            else:
+                detail=(f"Detalle: {d.get('equipment_details','')}\nTrabajo y ubicación: {d.get('work_location','')}\nFecha, duración y operador: {d.get('dates_operator','')}" )
         elif d.get('service_details'):
             detail='Caso: '+d['service_details']
         elif d.get('sale_details'):
