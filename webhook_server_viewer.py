@@ -34,8 +34,8 @@ WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜🏗️\n\n'
            '2️⃣ Alquiler de grúa tipo planchón\n'
            '3️⃣ Mantenimiento o reparación\n'
            '4️⃣ Venta de equipos o repuestos\n'
-           '5️⃣ Solicitar visita técnica\n'
-           '6️⃣ Hablar con un asesor')
+           '5️⃣ Solicitar visita técnica\n\n'
+           'En cualquier momento escribe MENU para volver al inicio.')
 
 def db():
     if DATABASE_URL and psycopg2:
@@ -101,12 +101,28 @@ def send_admin_alert(text):
     except Exception as e: print('Error alerta:',e,flush=True)
     return False
 
+def finish_request(s):
+    d=s['data']; s['step']='done'
+    if d.get('service'):
+        if d.get('service')=='Alquiler de grúa tipo planchón':
+            detail=(f"Vehículo/equipo, recogida y destino: {d.get('equipment_details','')}\nFecha y hora: {d.get('dates_operator','')}" )
+        else:
+            detail=(f"Detalle: {d.get('equipment_details','')}\nTrabajo y ubicación: {d.get('work_location','')}\nFecha, duración y operador: {d.get('dates_operator','')}" )
+    elif d.get('service_details'):
+        detail='Caso: '+d['service_details']
+    elif d.get('sale_details'):
+        detail='Solicitud: '+d['sale_details']
+    else:
+        detail='Visita: '+d.get('visit_details','')
+    files=len(d.get('attachments',[]))
+    attached=f'\nArchivos adjuntos: {files}' if files else ''
+    extra=f"\nInformación adicional: {d.get('additional_info','')}" if d.get('additional_info') else ''
+    return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{attached}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
+
 def process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
-    if low in {'hola','buenas','inicio','menu','menú','0','reiniciar'}:
+    if low in {'hola','buenas','inicio','menu','menú','menu principal','menú principal','0','reiniciar'}:
         s.update(step='menu',data={}); return WELCOME
-    if low in {'asesor','persona','humano'}:
-        s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
     if s['step']=='menu':
         if text=='1' or 'montacarga' in low:
             s.update(step='rental_equipment',data={'service':'Alquiler de montacargas'})
@@ -120,8 +136,7 @@ def process(sender,text):
             s['data']['service']='Venta de equipos o repuestos'; s['step']='sale'; return '¿Qué equipo o repuesto buscas? Indícanos la marca o referencia, si la conoces.'
         if text=='5' or 'visita' in low:
             s['data']['service']='Visita técnica'; s['step']='visit'; return '¿En qué ciudad o dirección necesitas la visita técnica y qué equipo revisaremos?'
-        if text=='6' or 'asesor' in low or 'persona' in low: s['data']['service']='Asesor humano'; s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
-        return 'Por favor responde con un número del 1 al 6.\n\n'+WELCOME
+        return 'Por favor responde con un número del 1 al 5.\n\n'+WELCOME
     if s['step']=='rental_equipment':
         s['data']['equipment_details']=text
         if s['data'].get('service')=='Alquiler de grúa tipo planchón':
@@ -134,29 +149,32 @@ def process(sender,text):
             s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Puedes enviar una foto del vehículo o equipo si aplica.'
         s['step']='dates'; return '¿Para qué fecha inicia y por cuánto tiempo necesitas el alquiler? ¿Requieres operador?'
     if s['step']=='dates':
-        s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Si aplica, puedes enviar fotos o videos del trabajo.'
+        s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
+    if s['step']=='attachments_choice':
+        if low in {'si','sí','s'}:
+            s['step']='attachments'; return 'Envía la foto, video o documento que desees adjuntar.'
+        if low in {'no','n'}:
+            return finish_request(s)
+        return 'Por favor responde SI o NO.\n\n¿Deseas adjuntar fotos, videos o documentos?'
+    if s['step']=='attachments':
+        return 'Archivo recibido. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
+    if s['step']=='additional_choice':
+        if low in {'si','sí','s'}:
+            s['step']='additional_info'; return 'Escribe la información adicional que deseas agregar.'
+        if low in {'no','n'}:
+            return finish_request(s)
+        return 'Por favor responde SI o NO. ¿Deseas agregar alguna información adicional?'
+    if s['step']=='additional_info':
+        s['data']['additional_info']=text; return finish_request(s)
     if s['step']=='contact':
-        s['data']['contact']=text; d=s['data']; s['step']='done'
-        if d.get('service'):
-            if d.get('service')=='Alquiler de grúa tipo planchón':
-                detail=(f"Vehículo/equipo, recogida y destino: {d.get('equipment_details','')}\nFecha y hora: {d.get('dates_operator','')}" )
-            else:
-                detail=(f"Detalle: {d.get('equipment_details','')}\nTrabajo y ubicación: {d.get('work_location','')}\nFecha, duración y operador: {d.get('dates_operator','')}" )
-        elif d.get('service_details'):
-            detail='Caso: '+d['service_details']
-        elif d.get('sale_details'):
-            detail='Solicitud: '+d['sale_details']
-        else:
-            detail='Visita: '+d.get('visit_details','')
-        return f"✅ Recibimos tu solicitud.\n\n{detail}\nCliente: {d['contact']}\n\nUn asesor de DT Grúas y Montacargas revisará la información y te contactará."
+        s['data']['contact']=text; s['step']='attachments_choice'
+        return '¿Deseas adjuntar fotos, videos o documentos para complementar tu solicitud? Responde SI o NO.'
     if s['step']=='service':
-        s['data']['service_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono? Puedes enviar fotos o videos de la falla.'
+        s['data']['service_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='sale':
-        s['data']['sale_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono para enviarte disponibilidad y precio?'
+        s['data']['sale_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='visit':
-        s['data']['visit_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono para coordinar la visita?'
-    if s['step']=='advisor':
-        s['data']['contact']=text; s['step']='done'; return 'Gracias. Un asesor de DT Grúas y Montacargas te contactará pronto.'
+        s['data']['visit_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     return 'Escribe hola para volver al menú principal.'
 
 @app.get('/webhook')
@@ -172,9 +190,25 @@ def webhook():
             for change in entry.get('changes',[]):
                 for m in change.get('value',{}).get('messages',[]):
                     sender=m.get('from') or m.get('from_user_id')
-                    if sender and m.get('type')=='text':
-                        text=m.get('text',{}).get('body',''); save(sender,'in',text)
-                        reply=process(sender,text); send_text(sender,reply)
+                    if sender and m.get('type') in ('text','image','video','document','audio'):
+                        kind=m.get('type')
+                        if kind=='text':
+                            text=m.get('text',{}).get('body','')
+                            reply=process(sender,text)
+                        else:
+                            media=m.get(kind,{}) or {}; filename=media.get('filename',''); media_id=media.get('id','')
+                            text=f'📎 Archivo recibido: {kind}'+(f' ({filename})' if filename else '')
+                            state=conversations.setdefault(sender,{'step':'menu','data':{}})
+                            state.setdefault('data',{}).setdefault('attachments',[]).append({'type':kind,'id':media_id,'filename':filename})
+                            if state.get('step') in ('attachments','additional_choice','additional_info'):
+                                state['step']='additional_choice'
+                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
+                            else:
+                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
+                                state['step']='additional_choice'
+                        if 'En cualquier momento escribe MENU' not in reply:
+                            reply += '\n\n↩️ Menú principal: escribe 0 o MENU PRINCIPAL.'
+                        save(sender,'in',text); send_text(sender,reply)
                         state=conversations.get(sender,{})
                         urgent=any(x in text.lower() for x in ('urgente','ya','hoy','parado','no funciona','emergencia'))
                         qualified=state.get('step') in ('done','advisor')
@@ -182,6 +216,7 @@ def webhook():
                             service=state.get('data',{}).get('service','Por definir')
                             alert=('🔔 NUEVO MENSAJE DT GRÚAS\\n\\nCliente: '+sender+'\\n'
                                    +'Servicio: '+service+'\\n'
+                                   +'Tipo: '+kind+'\\n'
                                    +'Motivo: '+('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))+'\\n'
                                    +'Último mensaje: '+text+'\\n\\n'
                                    +'Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
@@ -216,8 +251,12 @@ def print_all():
 def dashboard():
     if not authorized(request): return login()
     c=db(); rows=c.execute('SELECT sender,MAX(created_at) last_time,COUNT(*) total FROM messages GROUP BY sender ORDER BY last_time DESC').fetchall(); c.close()
-    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><div class="actions"><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
-    if not rows: out.append('<div class="card">No hay mensajes todavía.</div>')
+    q=request.args.get('q','').strip().lower(); status_filter=request.args.get('status','').strip()
+    rows=[r for r in rows if (not q or q in r['sender'].lower()) and (not status_filter or get_status(r['sender'])==status_filter)]
+    q_safe=html.escape(request.args.get('q','')); status_safe=html.escape(status_filter)
+    opts=''.join(f'<option {"selected" if x==status_filter else ""}>{x}</option>' for x in ('','Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}input,select,button{padding:9px;margin:4px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><form method="get"><input name="q" placeholder="Buscar por teléfono" value="'+q_safe+'"><select name="status">'+opts+'</select><button>Filtrar</button> <a href="/dashboard">Limpiar</a></form><div class="actions"><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
+    if not rows: out.append('<div class="card">No hay conversaciones que coincidan.</div>')
     for r in rows:
         status=html.escape(get_status(r['sender']))
         out.append(f'<div class="card"><a href="/dashboard/{r["sender"]}"><b>{r["sender"]}</b></a><br>Estado: <b>{status}</b><br>{r["total"]} mensajes · {r["last_time"]}</div>')
