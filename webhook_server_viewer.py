@@ -67,6 +67,14 @@ def set_status(sender,status):
     else: c.execute('INSERT INTO conversation_meta(sender,status) VALUES(?,?)',(sender,status))
     c.commit(); c.close()
 
+QUICK_REPLIES = [
+    ('📄 Solicitar datos', 'Hola, gracias por contactarnos. Para preparar tu cotización, por favor envíanos nombre, empresa, teléfono y los datos del servicio que necesitas.'),
+    ('✅ Confirmar recepción', 'Hemos recibido tu información correctamente. Nuestro equipo la revisará y un asesor se pondrá en contacto contigo.'),
+    ('⏱️ Tiempo de respuesta', 'Gracias por escribirnos. Estamos revisando tu solicitud y te responderemos lo antes posible dentro de nuestro horario de atención.'),
+    ('📍 Pedir ubicación', 'Por favor compártenos la ciudad y dirección exacta donde se realizará el servicio.'),
+    ('📞 Pedir llamada', '¿En qué horario te podemos llamar para ampliar la información de tu solicitud?'),
+]
+
 def authorized(req):
     h=req.headers.get('Authorization','')
     if not DASHBOARD_PASSWORD or not h.startswith('Basic '): return False
@@ -247,6 +255,35 @@ def print_all():
     if not rows: out.append('<p>No hay mensajes todavía.</p>')
     return ''.join(out)
 
+@app.get('/dashboard/stats')
+def stats():
+    if not authorized(request): return login()
+    c=db()
+    total_conversations=c.execute('SELECT COUNT(DISTINCT sender) n FROM messages').fetchone()['n']
+    total_messages=c.execute('SELECT COUNT(*) n FROM messages').fetchone()['n']
+    incoming=c.execute("SELECT COUNT(*) n FROM messages WHERE direction='in'").fetchone()['n']
+    status_rows=c.execute('SELECT status,COUNT(*) n FROM conversation_meta GROUP BY status ORDER BY status').fetchall()
+    service_rows=c.execute("SELECT body,COUNT(DISTINCT sender) n FROM messages WHERE direction='out' AND (body LIKE '%montacargas%' OR body LIKE '%grúa%' OR body LIKE '%Mantenimiento%' OR body LIKE '%Venta%' OR body LIKE '%Visita%') GROUP BY body").fetchall()
+    c.close()
+    statuses={r['status']:r['n'] for r in status_rows}
+    services=[('Alquiler de montacargas',0),('Alquiler de grúa tipo planchón',0),('Mantenimiento o reparación',0),('Venta de equipos o repuestos',0),('Visita técnica',0)]
+    # Count conversations by service keywords found in their outbound questions/summaries.
+    for label,_ in services:
+        terms=[label]
+        if label.startswith('Alquiler de montacargas'): terms=['montacargas']
+        elif label.startswith('Alquiler de grúa'): terms=['grúa','grua','planchón','planchon']
+        elif label.startswith('Mantenimiento'): terms=['mantenimiento','reparación','reparacion']
+        elif label.startswith('Venta'): terms=['venta','repuesto']
+        elif label.startswith('Visita'): terms=['visita técnica','visita tecnica']
+        n=0
+        for term in terms:
+            n=max(n, next((r['n'] for r in service_rows if term.lower() in r['body'].lower()),0))
+        services[services.index((label,0))]=(label,n)
+    cards=''.join(f'<div class="metric"><b>{html.escape(str(v))}</b><span>{html.escape(k)}</span></div>' for k,v in [('Conversaciones',total_conversations),('Mensajes totales',total_messages),('Mensajes de clientes',incoming)])
+    status_html=''.join(f'<tr><td>{html.escape(k)}</td><td><b>{v}</b></td></tr>' for k,v in statuses.items()) or '<tr><td colspan="2">Sin estados registrados</td></tr>'
+    service_html=''.join(f'<tr><td>{html.escape(k)}</td><td><b>{v}</b></td></tr>' for k,v in services)
+    return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estadísticas - DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8;color:#1f2937}.top{display:flex;gap:10px;flex-wrap:wrap}.metric,.box{background:white;padding:18px;border-radius:10px;margin:8px 0;box-shadow:0 1px 4px #ccd}.metric{min-width:160px}.metric b{display:block;font-size:30px;color:#075e9b}.metric span{display:block;margin-top:6px}table{width:100%;max-width:600px;border-collapse:collapse;background:white;margin:10px 0 22px}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-bottom:16px}</style><a class="btn" href="/dashboard">← Volver al visor</a><h1>Estadísticas comerciales</h1><div class="top">'+cards+'</div><div class="box"><h2>Conversaciones por estado</h2><table><tr><th>Estado</th><th>Cantidad</th></tr>'+status_html+'</table><h2>Solicitudes por servicio</h2><table><tr><th>Servicio</th><th>Conversaciones</th></tr>'+service_html+'</table></div>'
+
 @app.get('/dashboard')
 def dashboard():
     if not authorized(request): return login()
@@ -255,7 +292,7 @@ def dashboard():
     rows=[r for r in rows if (not q or q in r['sender'].lower()) and (not status_filter or get_status(r['sender'])==status_filter)]
     q_safe=html.escape(request.args.get('q','')); status_safe=html.escape(status_filter)
     opts=''.join(f'<option {"selected" if x==status_filter else ""}>{x}</option>' for x in ('','Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
-    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}input,select,button{padding:9px;margin:4px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><form method="get"><input name="q" placeholder="Buscar por teléfono" value="'+q_safe+'"><select name="status">'+opts+'</select><button>Filtrar</button> <a href="/dashboard">Limpiar</a></form><div class="actions"><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}input,select,button{padding:9px;margin:4px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><form method="get"><input name="q" placeholder="Buscar por teléfono" value="'+q_safe+'"><select name="status">'+opts+'</select><button>Filtrar</button> <a href="/dashboard">Limpiar</a></form><div class="actions"><a class="btn" href="/dashboard/stats">📊 Estadísticas comerciales</a><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
     if not rows: out.append('<div class="card">No hay conversaciones que coincidan.</div>')
     for r in rows:
         status=html.escape(get_status(r['sender']))
@@ -275,7 +312,8 @@ def chat(sender):
     safe_sender=html.escape(sender)
     current_status=html.escape(get_status(sender))
     options=''.join(f'<option {"selected" if x==current_status else ""}>{x}</option>' for x in ('Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
-    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><form method="post">Estado: <select name="status">{options}</select> <button>Guardar estado</button></form><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a>']
+    quick=''.join('<form method="post" style="display:inline"><input type="hidden" name="text" value="'+html.escape(msg,quote=True)+'"><button type="submit">'+html.escape(label)+'</button></form>' for label,msg in QUICK_REPLIES)
+    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}.quick{{background:#f4f6f8;padding:10px;border-radius:8px;margin:10px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><form method="post">Estado: <select name="status">{options}</select> <button>Guardar estado</button></form><a class="btn" href="/dashboard/stats">📊 Estadísticas</a> <a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><div class="quick"><b>Respuestas rápidas:</b><br>{quick}</div>']
     for r in rows: out.append(f'<div class="{r["direction"]}"><small>{html.escape(r["created_at"])}</small><br>{html.escape(r["body"])}</div>')
     out.append('<form method="post"><textarea name="text" placeholder="Escribir respuesta..."></textarea><button>Enviar</button></form>'); return ''.join(out)
 
