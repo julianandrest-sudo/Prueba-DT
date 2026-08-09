@@ -60,7 +60,8 @@ def send_text(to,text):
     save(to,'out',text)
     if not META_ACCESS_TOKEN: return False
     url=f'https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages'
-    payload=json.dumps({'messaging_product':'whatsapp','to':to,'type':'text','text':{'preview_url':False,'body':text}}).encode()
+    recipient={'recipient':to} if isinstance(to,str) and '.' in to else {'to':to}
+    payload=json.dumps({'messaging_product':'whatsapp','recipient_type':'individual',**recipient,'type':'text','text':{'preview_url':False,'body':text}}).encode()
     req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
     try:
         with urllib.request.urlopen(req,timeout=15) as r: print('Meta',r.status,r.read().decode(),flush=True)
