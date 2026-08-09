@@ -110,16 +110,16 @@ def webhook():
         for entry in data.get('entry',[]):
             for change in entry.get('changes',[]):
                 for m in change.get('value',{}).get('messages',[]):
-                    sender=m.get('from')
+                    sender=m.get('from') or m.get('from_user_id')
                     if sender and m.get('type')=='text':
                         text=m.get('text',{}).get('body',''); save(sender,'in',text)
                         reply=process(sender,text); send_text(sender,reply)
                         state=conversations.get(sender,{})
                         urgent=any(x in text.lower() for x in ('urgente','ya','hoy','parado','no funciona','emergencia'))
                         qualified=state.get('step') in ('done','advisor')
-                        if sender != ADMIN_PHONE and (urgent or qualified):
-                            alert=('🚨 ALERTA DT GRÚAS\\n\\nCliente: '+sender+'\\n'
-                                   +'Motivo: '+('Solicitud urgente' if urgent else 'Nueva solicitud comercial')+'\\n'
+                        if sender != ADMIN_PHONE:
+                            alert=('🔔 NUEVO MENSAJE DT GRÚAS\\n\\nCliente: '+sender+'\\n'
+                                   +'Motivo: '+('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))+'\\n'
                                    +'Último mensaje: '+text+'\\n\\n'
                                    +'Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
                             send_admin_alert(alert)
