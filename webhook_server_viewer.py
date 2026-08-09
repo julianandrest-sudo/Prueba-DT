@@ -98,12 +98,12 @@ def process(sender,text):
             s.update(step='rental_equipment',data={'service':'Alquiler de grúa tipo planchón'})
             return 'Perfecto. ¿Qué vehículo o equipo necesitas transportar y cuál es el lugar de recogida y destino?'
         if text=='3' or 'mantenimiento' in low or 'reparación' in low or 'reparacion' in low:
-            s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
+            s['data']['service']='Mantenimiento y reparación'; s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
         if text=='4' or 'venta' in low or 'repuesto' in low:
-            s['step']='sale'; return '¿Qué equipo o repuesto buscas? Indícanos la marca o referencia, si la conoces.'
+            s['data']['service']='Venta de equipos o repuestos'; s['step']='sale'; return '¿Qué equipo o repuesto buscas? Indícanos la marca o referencia, si la conoces.'
         if text=='5' or 'visita' in low:
-            s['step']='visit'; return '¿En qué ciudad o dirección necesitas la visita técnica y qué equipo revisaremos?'
-        if text=='6' or 'asesor' in low or 'persona' in low: s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
+            s['data']['service']='Visita técnica'; s['step']='visit'; return '¿En qué ciudad o dirección necesitas la visita técnica y qué equipo revisaremos?'
+        if text=='6' or 'asesor' in low or 'persona' in low: s['data']['service']='Asesor humano'; s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
         return 'Por favor responde con un número del 1 al 6.\n\n'+WELCOME
     if s['step']=='rental_equipment':
         s['data']['equipment_details']=text; s['step']='work'
@@ -158,7 +158,9 @@ def webhook():
                         urgent=any(x in text.lower() for x in ('urgente','ya','hoy','parado','no funciona','emergencia'))
                         qualified=state.get('step') in ('done','advisor')
                         if sender != ADMIN_PHONE:
+                            service=state.get('data',{}).get('service','Por definir')
                             alert=('🔔 NUEVO MENSAJE DT GRÚAS\\n\\nCliente: '+sender+'\\n'
+                                   +'Servicio: '+service+'\\n'
                                    +'Motivo: '+('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))+'\\n'
                                    +'Último mensaje: '+text+'\\n\\n'
                                    +'Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
