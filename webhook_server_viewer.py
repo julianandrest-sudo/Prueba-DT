@@ -31,7 +31,7 @@ class PGConnection:
 WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜🏗️\n\n'
            '¿En qué podemos ayudarte?\n'
            '1️⃣ Alquiler de montacargas\n'
-           '2️⃣ Alquiler de grúas\n'
+           '2️⃣ Alquiler de grúa tipo planchón\n'
            '3️⃣ Mantenimiento o reparación\n'
            '4️⃣ Venta de equipos o repuestos\n'
            '5️⃣ Solicitar visita técnica\n'
@@ -94,9 +94,9 @@ def process(sender,text):
         if text=='1' or 'montacarga' in low:
             s.update(step='rental_equipment',data={'service':'Alquiler de montacargas'})
             return 'Perfecto. ¿Qué capacidad y altura de elevación necesitas?'
-        if text=='2' or ('alquiler' in low and 'grúa' in low) or ('alquiler' in low and 'grua' in low):
-            s.update(step='rental_equipment',data={'service':'Alquiler de grúas'})
-            return 'Perfecto. ¿Qué tipo de grúa, capacidad y altura de trabajo necesitas?'
+        if text=='2' or ('alquiler' in low and 'grúa' in low) or ('alquiler' in low and 'grua' in low) or 'planchón' in low or 'planchon' in low:
+            s.update(step='rental_equipment',data={'service':'Alquiler de grúa tipo planchón'})
+            return 'Perfecto. ¿Qué vehículo o equipo necesitas transportar y cuál es el lugar de recogida y destino?'
         if text=='3' or 'mantenimiento' in low or 'reparación' in low or 'reparacion' in low:
             s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
         if text=='4' or 'venta' in low or 'repuesto' in low:
@@ -106,9 +106,15 @@ def process(sender,text):
         if text=='6' or 'asesor' in low or 'persona' in low: s['step']='advisor'; return 'Claro. Déjanos tu nombre y empresa; un asesor te contactará lo antes posible.'
         return 'Por favor responde con un número del 1 al 6.\n\n'+WELCOME
     if s['step']=='rental_equipment':
-        s['data']['equipment_details']=text; s['step']='work'; return '¿Qué tipo de trabajo realizarás y en qué ciudad o dirección?'
+        s['data']['equipment_details']=text; s['step']='work'
+        if s['data'].get('service')=='Alquiler de grúa tipo planchón':
+            return '¿Para qué fecha y hora necesitas el servicio?'
+        return '¿Qué tipo de trabajo realizarás y en qué ciudad o dirección?'
     if s['step']=='work':
-        s['data']['work_location']=text; s['step']='dates'; return '¿Para qué fecha inicia y por cuánto tiempo necesitas el alquiler? ¿Requieres operador?'
+        s['data']['work_location']=text
+        if s['data'].get('service')=='Alquiler de grúa tipo planchón':
+            s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Puedes enviar una foto del vehículo o equipo si aplica.'
+        s['step']='dates'; return '¿Para qué fecha inicia y por cuánto tiempo necesitas el alquiler? ¿Requieres operador?'
     if s['step']=='dates':
         s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Si aplica, puedes enviar fotos o videos del trabajo.'
     if s['step']=='contact':
