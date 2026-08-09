@@ -41,14 +41,31 @@ def db():
     if DATABASE_URL and psycopg2:
         c=PGConnection(DATABASE_URL)
         c.execute('CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
         c.commit(); return c
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
-    c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)'); c.commit(); return c
+    c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')'); c.commit(); return c
 
 def save(sender,direction,body):
     try:
         c=db(); c.execute('INSERT INTO messages(sender,direction,body,created_at) VALUES(?,?,?,?)',(sender,direction,body,datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
     except Exception as e: print('Error guardando mensaje:',e,flush=True)
+
+def get_status(sender):
+    try:
+        c=db(); r=c.execute('SELECT status FROM conversation_meta WHERE sender=?',(sender,)).fetchone()
+        if not r:
+            c.execute('INSERT INTO conversation_meta(sender,status) VALUES(?,?)',(sender,'Nuevo')); c.commit(); status='Nuevo'
+        else: status=r['status']
+        c.close(); return status
+    except Exception: return 'Nuevo'
+
+def set_status(sender,status):
+    c=db(); r=c.execute('SELECT sender FROM conversation_meta WHERE sender=?',(sender,)).fetchone()
+    if r: c.execute('UPDATE conversation_meta SET status=? WHERE sender=?',(status,sender))
+    else: c.execute('INSERT INTO conversation_meta(sender,status) VALUES(?,?)',(sender,status))
+    c.commit(); c.close()
 
 def authorized(req):
     h=req.headers.get('Authorization','')
@@ -201,19 +218,25 @@ def dashboard():
     c=db(); rows=c.execute('SELECT sender,MAX(created_at) last_time,COUNT(*) total FROM messages GROUP BY sender ORDER BY last_time DESC').fetchall(); c.close()
     out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><div class="actions"><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a></div>']
     if not rows: out.append('<div class="card">No hay mensajes todavía.</div>')
-    for r in rows: out.append(f'<div class="card"><a href="/dashboard/{r["sender"]}"><b>{r["sender"]}</b></a><br>{r["total"]} mensajes · {r["last_time"]}</div>')
+    for r in rows:
+        status=html.escape(get_status(r['sender']))
+        out.append(f'<div class="card"><a href="/dashboard/{r["sender"]}"><b>{r["sender"]}</b></a><br>Estado: <b>{status}</b><br>{r["total"]} mensajes · {r["last_time"]}</div>')
     return ''.join(out)
 
 @app.route('/dashboard/<sender>',methods=['GET','POST'])
 def chat(sender):
     if not authorized(request): return login()
     if request.method=='POST':
+        if request.form.get('status'):
+            set_status(sender,request.form.get('status'))
         text=request.form.get('text','').strip()
         if text: send_text(sender,text)
         return redirect('/dashboard/'+sender)
     c=db(); rows=c.execute('SELECT direction,body,created_at FROM messages WHERE sender=? ORDER BY id',(sender,)).fetchall(); c.close()
     safe_sender=html.escape(sender)
-    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a>']
+    current_status=html.escape(get_status(sender))
+    options=''.join(f'<option {"selected" if x==current_status else ""}>{x}</option>' for x in ('Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
+    out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><form method="post">Estado: <select name="status">{options}</select> <button>Guardar estado</button></form><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a>']
     for r in rows: out.append(f'<div class="{r["direction"]}"><small>{html.escape(r["created_at"])}</small><br>{html.escape(r["body"])}</div>')
     out.append('<form method="post"><textarea name="text" placeholder="Escribir respuesta..."></textarea><button>Enviar</button></form>'); return ''.join(out)
 
