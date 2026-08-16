@@ -1,4 +1,4 @@
-import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html
+import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html, time, uuid
 from datetime import datetime, timezone
 from flask import Flask, request, Response, redirect
 try:
@@ -42,10 +42,13 @@ def db():
         c=PGConnection(DATABASE_URL)
         c.execute('CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+        c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
         c.commit(); return c
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
     c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')'); c.commit(); return c
+    c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+    c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
+    c.commit(); return c
 
 def save(sender,direction,body):
     try:
@@ -98,15 +101,43 @@ def send_text(to,text):
     except Exception as e: print('Error enviando',e,flush=True)
     return False
 
-def send_admin_alert(text):
-    if not META_ACCESS_TOKEN or not ADMIN_PHONE: return False
+def send_admin_alert(text, sender=''):
+    alert_id=uuid.uuid4().hex
+    created=datetime.now(timezone.utc).isoformat()
+    try:
+        c=db(); c.execute('INSERT INTO admin_alerts(id,sender,body,status,attempts,error,created_at,sent_at) VALUES(?,?,?,?,?,?,?,?)',(alert_id,sender,text,'pending',0,'',created,'')); c.commit(); c.close()
+    except Exception as e:
+        print('Error registrando alerta:',e,flush=True)
+        return False
+    if not META_ACCESS_TOKEN or not ADMIN_PHONE:
+        error='Falta META_ACCESS_TOKEN o ADMIN_PHONE'
+        try:
+            c=db(); c.execute('UPDATE admin_alerts SET status=?,error=? WHERE id=?',('failed',error,alert_id)); c.commit(); c.close()
+        except Exception: pass
+        print('Alerta fallida:',error,flush=True)
+        return False
     url=f'https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages'
     payload=json.dumps({'messaging_product':'whatsapp','to':ADMIN_PHONE,'type':'text','text':{'preview_url':False,'body':text}}).encode()
-    req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
+    last_error='Error desconocido'
+    for attempt in range(1,3):
+        try:
+            c=db(); c.execute('UPDATE admin_alerts SET attempts=? WHERE id=?',(attempt,alert_id)); c.commit(); c.close()
+            req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
+            with urllib.request.urlopen(req,timeout=8) as r:
+                response=r.read().decode()
+                print('Alerta enviada',r.status,response,flush=True)
+            c=db(); c.execute('UPDATE admin_alerts SET status=?,error=?,sent_at=? WHERE id=?',('sent','',datetime.now(timezone.utc).isoformat(),alert_id)); c.commit(); c.close()
+            return True
+        except urllib.error.HTTPError as e:
+            detail=e.read().decode(errors='replace')
+            last_error=f'HTTP {e.code}: {detail[:500]}'
+        except Exception as e:
+            last_error=str(e)[:500]
+        print(f'Error alerta intento {attempt}: {last_error}',flush=True)
+        if attempt < 2: time.sleep(1)
     try:
-        with urllib.request.urlopen(req,timeout=15) as r: print('Alerta enviada',r.status,flush=True)
-        return True
-    except Exception as e: print('Error alerta:',e,flush=True)
+        c=db(); c.execute('UPDATE admin_alerts SET status=?,error=? WHERE id=?',('failed',last_error,alert_id)); c.commit(); c.close()
+    except Exception as e: print('Error guardando fallo de alerta:',e,flush=True)
     return False
 
 def finish_request(s):
@@ -222,13 +253,13 @@ def webhook():
                         qualified=state.get('step') in ('done','advisor')
                         if sender != ADMIN_PHONE:
                             service=state.get('data',{}).get('service','Por definir')
-                            alert=('🔔 NUEVO MENSAJE DT GRÚAS\\n\\nCliente: '+sender+'\\n'
-                                   +'Servicio: '+service+'\\n'
-                                   +'Tipo: '+kind+'\\n'
-                                   +'Motivo: '+('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))+'\\n'
-                                   +'Último mensaje: '+text+'\\n\\n'
+                            alert=('🔔 NUEVO MENSAJE DT GRÚAS\n\nCliente: '+sender+'\n'
+                                   +'Servicio: '+service+'\n'
+                                   +'Tipo: '+kind+'\n'
+                                   +'Motivo: '+('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))+'\n'
+                                   +'Último mensaje: '+text+'\n\n'
                                    +'Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
-                            send_admin_alert(alert)
+                            send_admin_alert(alert, sender)
     except Exception as e: print('Error procesando:',e,flush=True)
     return 'EVENT_RECEIVED',200
 
@@ -263,9 +294,11 @@ def stats():
     total_messages=c.execute('SELECT COUNT(*) n FROM messages').fetchone()['n']
     incoming=c.execute("SELECT COUNT(*) n FROM messages WHERE direction='in'").fetchone()['n']
     status_rows=c.execute('SELECT status,COUNT(*) n FROM conversation_meta GROUP BY status ORDER BY status').fetchall()
+    alert_rows=c.execute('SELECT status,COUNT(*) n FROM admin_alerts GROUP BY status ORDER BY status').fetchall()
     service_rows=c.execute("SELECT body,COUNT(DISTINCT sender) n FROM messages WHERE direction='out' AND (body LIKE '%montacargas%' OR body LIKE '%grúa%' OR body LIKE '%Mantenimiento%' OR body LIKE '%Venta%' OR body LIKE '%Visita%') GROUP BY body").fetchall()
     c.close()
     statuses={r['status']:r['n'] for r in status_rows}
+    alert_statuses={r['status']:r['n'] for r in alert_rows}
     services=[('Alquiler de montacargas',0),('Alquiler de grúa tipo planchón',0),('Mantenimiento o reparación',0),('Venta de equipos o repuestos',0),('Visita técnica',0)]
     # Count conversations by service keywords found in their outbound questions/summaries.
     for label,_ in services:
@@ -281,8 +314,9 @@ def stats():
         services[services.index((label,0))]=(label,n)
     cards=''.join(f'<div class="metric"><b>{html.escape(str(v))}</b><span>{html.escape(k)}</span></div>' for k,v in [('Conversaciones',total_conversations),('Mensajes totales',total_messages),('Mensajes de clientes',incoming)])
     status_html=''.join(f'<tr><td>{html.escape(k)}</td><td><b>{v}</b></td></tr>' for k,v in statuses.items()) or '<tr><td colspan="2">Sin estados registrados</td></tr>'
+    alert_html=''.join(f'<tr><td>{html.escape(k)}</td><td><b>{v}</b></td></tr>' for k,v in alert_statuses.items()) or '<tr><td colspan="2">Sin alertas registradas</td></tr>'
     service_html=''.join(f'<tr><td>{html.escape(k)}</td><td><b>{v}</b></td></tr>' for k,v in services)
-    return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estadísticas - DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8;color:#1f2937}.top{display:flex;gap:10px;flex-wrap:wrap}.metric,.box{background:white;padding:18px;border-radius:10px;margin:8px 0;box-shadow:0 1px 4px #ccd}.metric{min-width:160px}.metric b{display:block;font-size:30px;color:#075e9b}.metric span{display:block;margin-top:6px}table{width:100%;max-width:600px;border-collapse:collapse;background:white;margin:10px 0 22px}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-bottom:16px}</style><a class="btn" href="/dashboard">← Volver al visor</a><h1>Estadísticas comerciales</h1><div class="top">'+cards+'</div><div class="box"><h2>Conversaciones por estado</h2><table><tr><th>Estado</th><th>Cantidad</th></tr>'+status_html+'</table><h2>Solicitudes por servicio</h2><table><tr><th>Servicio</th><th>Conversaciones</th></tr>'+service_html+'</table></div>'
+    return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estadísticas - DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8;color:#1f2937}.top{display:flex;gap:10px;flex-wrap:wrap}.metric,.box{background:white;padding:18px;border-radius:10px;margin:8px 0;box-shadow:0 1px 4px #ccd}.metric{min-width:160px}.metric b{display:block;font-size:30px;color:#075e9b}.metric span{display:block;margin-top:6px}table{width:100%;max-width:600px;border-collapse:collapse;background:white;margin:10px 0 22px}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-bottom:16px}</style><a class="btn" href="/dashboard">← Volver al visor</a><h1>Estadísticas comerciales</h1><div class="top">'+cards+'</div><div class="box"><h2>Conversaciones por estado</h2><table><tr><th>Estado</th><th>Cantidad</th></tr>'+status_html+'</table><h2>Alertas administrativas</h2><table><tr><th>Estado</th><th>Cantidad</th></tr>'+alert_html+'</table><h2>Solicitudes por servicio</h2><table><tr><th>Servicio</th><th>Conversaciones</th></tr>'+service_html+'</table></div>'
 
 @app.get('/dashboard')
 def dashboard():
