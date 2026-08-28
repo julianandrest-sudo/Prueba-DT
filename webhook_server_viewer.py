@@ -302,14 +302,26 @@ def process(sender,text):
     if s['step']=='rental_equipment':
         s['data']['equipment_details']=text
         if s['data'].get('service')=='Alquiler de grúa tipo planchón':
-            s['step']='dates'; return '¿Para qué fecha y hora necesitas el servicio?'
+            s['step']='origin'; return '¿Cuál es el lugar exacto de recogida?'
         s['step']='work'
         return '¿Qué tipo de trabajo realizarás y en qué ciudad o dirección?'
+    if s['step']=='origin':
+        s['data']['origin']=text; s['step']='destination'; return '¿Cuál es el destino exacto?'
+    if s['step']=='destination':
+        s['data']['destination']=text; s['step']='date'; return '¿Para qué fecha y hora necesitas el servicio?'
     if s['step']=='work':
-        s['data']['work_location']=text
+        s['data']['work_location']=text; s['step']='municipality'; return '¿En qué municipio se realizará el trabajo?'
+    if s['step']=='municipality':
+        s['data']['municipality']=text; s['step']='date'; return '¿Para qué fecha necesitas el servicio?'
+    if s['step']=='date':
+        s['data']['service_date']=text
         if s['data'].get('service')=='Alquiler de grúa tipo planchón':
             s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto? Puedes enviar una foto del vehículo o equipo si aplica.'
-        s['step']='dates'; return '¿Para qué fecha inicia y por cuánto tiempo necesitas el alquiler? ¿Requieres operador?'
+        s['step']='duration'; return '¿Por cuánto tiempo necesitas el alquiler?'
+    if s['step']=='duration':
+        s['data']['duration']=text; s['step']='operator'; return '¿Requieres operador? Responde SI o NO.'
+    if s['step']=='operator':
+        s['data']['operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='dates':
         s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='attachments_choice':
