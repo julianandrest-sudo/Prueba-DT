@@ -274,7 +274,9 @@ def finish_request(s, sender=''):
 def process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
     campaign=campaign_from_text(text)
-    if campaign: s.setdefault('data',{})['campaign']=campaign
+    if campaign:
+        current=s.setdefault('data',{}).get('campaign','')
+        if not current or ('-' in campaign and '-' not in current): s['data']['campaign']=campaign
     if 'facebook' in low or 'instagram' in low or 'meta ads' in low: s.setdefault('data',{})['source']='Meta'
     if low in {'hola','buenas','inicio','menu','menú','menu principal','menú principal','0','reiniciar'}:
         s.update(step='menu',data={}); return WELCOME
