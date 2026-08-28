@@ -282,10 +282,10 @@ def process(sender,text):
         s.update(step='menu',data={}); return WELCOME
     if s['step']=='menu':
         if text=='1' or 'montacarga' in low:
-            s.update(step='rental_equipment',data={'service':'Alquiler de montacargas'})
+            s.update(step='rental_equipment',data={'service':'Alquiler de montacargas', **({'campaign':campaign} if campaign else {})})
             return 'Perfecto. ¿Qué capacidad y altura de elevación necesitas?'
         if text=='2' or ('alquiler' in low and 'grúa' in low) or ('alquiler' in low and 'grua' in low) or 'planchón' in low or 'planchon' in low:
-            s.update(step='rental_equipment',data={'service':'Alquiler de grúa tipo planchón'})
+            s.update(step='rental_equipment',data={'service':'Alquiler de grúa tipo planchón', **({'campaign':campaign} if campaign else {})})
             return 'Perfecto. ¿Qué vehículo o equipo necesitas transportar y cuál es el lugar de recogida y destino?'
         if text=='3' or 'mantenimiento' in low or 'reparación' in low or 'reparacion' in low:
             s['data']['service']='Mantenimiento y reparación'; s['step']='service'; return 'Cuéntanos qué equipo necesita mantenimiento o reparación y cuál es la falla.'
