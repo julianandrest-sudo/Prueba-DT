@@ -1,5 +1,5 @@
 import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html, time, uuid, mimetypes, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, Response, redirect, send_file
 from pathlib import Path
@@ -35,6 +35,62 @@ def format_dt(value):
     except Exception:
         return str(value)
 
+FOLLOW_UP_DELAYS = {
+    'Urgente': timedelta(days=0),
+    'Alta': timedelta(hours=2),
+    'Media': timedelta(days=1),
+    'Baja': timedelta(days=3),
+}
+TERMINAL_PROSPECT_STATUSES = {'Ganado', 'Perdido'}
+
+
+def calculate_follow_up_at(priority, reference=None):
+    """Return the UTC ISO timestamp for the default follow-up deadline."""
+    reference = reference or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    delay = FOLLOW_UP_DELAYS.get(priority, FOLLOW_UP_DELAYS['Media'])
+    return (reference + delay).astimezone(timezone.utc).isoformat()
+
+
+def follow_up_state(value, status='Nuevo', now=None):
+    """Classify a follow-up for display; this never sends a customer message."""
+    if not value or status in TERMINAL_PROSPECT_STATUSES:
+        return 'Sin seguimiento pendiente'
+    try:
+        due = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if due <= current:
+            return 'Vencido'
+        return 'Próximo'
+    except (TypeError, ValueError):
+        return 'Fecha inválida'
+
+
+def is_follow_up_pending(row, now=None):
+    follow_up_at = row.get('follow_up_at') if hasattr(row, 'get') else row['follow_up_at']
+    status = row.get('status') if hasattr(row, 'get') else row['status']
+    return bool(follow_up_at) and status not in TERMINAL_PROSPECT_STATUSES
+
+
+def _backfill_follow_ups(connection):
+    """Populate deadlines for legacy rows without changing existing data."""
+    rows = connection.execute(
+        'SELECT id,priority,created_at FROM prospects WHERE follow_up_at IS NULL'
+    ).fetchall()
+    for row in rows:
+        created = row['created_at']
+        try:
+            reference = datetime.fromisoformat(str(created).replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            reference = datetime.now(timezone.utc)
+        connection.execute(
+            'UPDATE prospects SET follow_up_at=? WHERE id=?',
+            (calculate_follow_up_at(row['priority'], reference), row['id'])
+        )
+
 class PGConnection:
     def __init__(self, url):
         self.conn=psycopg2.connect(url, connect_timeout=10)
@@ -58,22 +114,62 @@ def db():
         c=PGConnection(DATABASE_URL)
         c.execute('CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+        c.execute('CREATE TABLE IF NOT EXISTS conversation_state (sender TEXT PRIMARY KEY, step TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
-        for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome'):
+        c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+        c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
             c.execute(f'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS {col} TEXT')
+        _backfill_follow_ups(c)
         c.commit(); return c
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
     c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+    c.execute('CREATE TABLE IF NOT EXISTS conversation_state (sender TEXT PRIMARY KEY, step TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL)')
     c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
-    c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
-    for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome'):
+    c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
         try: c.execute(f'ALTER TABLE prospects ADD COLUMN {col} TEXT')
         except sqlite3.OperationalError: pass
+    _backfill_follow_ups(c)
     c.commit(); return c
+
+def load_conversation_state(sender):
+    """Load a sender's state from durable storage, falling back to the menu."""
+    try:
+        c=db(); row=c.execute('SELECT step,data FROM conversation_state WHERE sender=?',(sender,)).fetchone(); c.close()
+        if row:
+            data=json.loads(row['data'])
+            if isinstance(data,dict) and isinstance(row['step'],str):
+                return {'step': row['step'], 'data': data}
+    except Exception as e:
+        print('Error cargando estado conversacional:',e,flush=True)
+    return {'step':'menu','data':{}}
+
+def save_conversation_state(sender, state):
+    """Upsert the small JSON state independently of messages/prospects."""
+    try:
+        step=state.get('step','menu')
+        data=json.dumps(state.get('data') or {}, ensure_ascii=False)
+        now=datetime.now(timezone.utc).isoformat()
+        c=db(); row=c.execute('SELECT sender FROM conversation_state WHERE sender=?',(sender,)).fetchone()
+        if row:
+            c.execute('UPDATE conversation_state SET step=?,data=?,updated_at=? WHERE sender=?',(step,data,now,sender))
+        else:
+            c.execute('INSERT INTO conversation_state(sender,step,data,updated_at) VALUES(?,?,?,?)',(sender,step,data,now))
+        c.commit(); c.close()
+    except Exception as e:
+        # State persistence must never break the existing WhatsApp flow.
+        print('Error guardando estado conversacional:',e,flush=True)
+
+def clear_conversation_state(sender):
+    state={'step':'menu','data':{}}
+    conversations[sender]=state
+    save_conversation_state(sender,state)
+    return state
 
 def save(sender,direction,body):
     try:
@@ -252,8 +348,10 @@ def save_prospect(sender, data):
     now=datetime.now(timezone.utc).isoformat()
     details=json.dumps(data, ensure_ascii=False)
     try:
-        c=db(); c.execute('''INSERT INTO prospects(id,sender,contact,service,campaign,source,municipality,origin,destination,weight,dimensions,service_date,duration,operator,quoted_value,next_action,outcome,priority,details,status,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(uuid.uuid4().hex,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),prospect_priority(details, True),details,'Nuevo',now,now)); c.commit(); c.close()
+        priority=prospect_priority(details, True)
+        follow_up_at=data.get('follow_up_at') or calculate_follow_up_at(priority)
+        c=db(); c.execute('''INSERT INTO prospects(id,sender,contact,service,campaign,source,municipality,origin,destination,weight,dimensions,service_date,duration,operator,quoted_value,next_action,outcome,priority,details,status,follow_up_at,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(uuid.uuid4().hex,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),priority,details,'Nuevo',follow_up_at,now,now)); c.commit(); c.close()
     except Exception as e: print('Error guardando prospecto:',e,flush=True)
 
 def finish_request(s, sender=''):
@@ -276,7 +374,7 @@ def finish_request(s, sender=''):
         save_prospect(sender, d); d['_prospect_saved']=True
     return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{attached}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
 
-def process(sender,text):
+def _process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
     campaign=campaign_from_text(text)
     if campaign:
@@ -351,6 +449,15 @@ def process(sender,text):
         s['data']['visit_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     return 'Escribe hola para volver al menú principal.'
 
+def process(sender,text):
+    # Render instances are ephemeral: hydrate before every turn and persist even
+    # when a branch returns early. The in-memory dict remains for compatibility.
+    conversations[sender]=load_conversation_state(sender)
+    try:
+        return _process(sender,text)
+    finally:
+        save_conversation_state(sender, conversations.get(sender, {'step':'menu','data':{}}))
+
 @app.get('/webhook')
 def verify():
     if request.args.get('hub.mode')=='subscribe' and request.args.get('hub.verify_token')==VERIFY_TOKEN: return request.args.get('hub.challenge',''),200
@@ -372,7 +479,8 @@ def webhook():
                         else:
                             media=m.get(kind,{}) or {}; filename=media.get('filename',''); media_id=media.get('id','')
                             text=f'📎 Archivo recibido: {kind}'+(f' ({filename})' if filename else '')
-                            state=conversations.setdefault(sender,{'step':'menu','data':{}})
+                            conversations[sender]=load_conversation_state(sender)
+                            state=conversations[sender]
                             state.setdefault('data',{}).setdefault('attachments',[]).append({'type':kind,'id':media_id,'filename':filename})
                             attachment_record, attachment_status, attachment_path=save_attachment(sender,media_id,kind,filename)
                             if state.get('step') in ('attachments','additional_choice','additional_info'):
@@ -381,6 +489,7 @@ def webhook():
                             else:
                                 reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
                                 state['step']='additional_choice'
+                            save_conversation_state(sender, state)
                         if 'En cualquier momento escribe MENU' not in reply:
                             reply += '\n\n↩️ Menú principal: escribe 0 o MENU PRINCIPAL.'
                         save(sender,'in',text); send_text(sender,reply)
@@ -430,9 +539,9 @@ def print_all():
 @app.get('/dashboard/prospects.csv')
 def prospects_csv():
     if not authorized(request): return login()
-    c=db(); rows=c.execute('SELECT id,sender,contact,service,campaign,source,priority,status,details,created_at,updated_at FROM prospects ORDER BY created_at DESC').fetchall(); c.close()
-    buf=io.StringIO(); writer=csv.writer(buf); writer.writerow(['ID','Teléfono','Contacto','Servicio','Campaña','Fuente','Prioridad','Estado','Detalles','Creado','Actualizado'])
-    for r in rows: writer.writerow([r['id'],r['sender'],r['contact'],r['service'],r['campaign'],r['source'],r['priority'],r['status'],r['details'],r['created_at'],r['updated_at']])
+    c=db(); rows=c.execute('SELECT id,sender,contact,service,campaign,source,priority,status,details,follow_up_at,created_at,updated_at FROM prospects ORDER BY created_at DESC').fetchall(); c.close()
+    buf=io.StringIO(); writer=csv.writer(buf); writer.writerow(['ID','Teléfono','Contacto','Servicio','Campaña','Fuente','Prioridad','Estado','Seguimiento','Estado seguimiento','Detalles','Creado','Actualizado'])
+    for r in rows: writer.writerow([r['id'],r['sender'],r['contact'],r['service'],r['campaign'],r['source'],r['priority'],r['status'],r['follow_up_at'],follow_up_state(r['follow_up_at'],r['status']),r['details'],r['created_at'],r['updated_at']])
     return Response('\ufeff'+buf.getvalue(),mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=dt_gruas_prospectos.csv'})
 
 @app.route('/dashboard/prospects', methods=['GET','POST'])
@@ -442,13 +551,45 @@ def prospects_dashboard():
         pid=request.form.get('id',''); status=request.form.get('status','').strip()
         if pid and status:
             c=db(); c.execute('UPDATE prospects SET status=?,updated_at=? WHERE id=?',(status,datetime.now(timezone.utc).isoformat(),pid)); c.commit(); c.close()
-    q=request.args.get('q','').strip().lower(); campaign=request.args.get('campaign','').strip(); priority=request.args.get('priority','').strip()
+    q=request.args.get('q','').strip().lower(); campaign=request.args.get('campaign','').strip(); priority=request.args.get('priority','').strip(); pending=request.args.get('pending','')=='1'
     c=db(); rows=c.execute('SELECT * FROM prospects ORDER BY created_at DESC').fetchall(); c.close()
-    rows=[r for r in rows if (not q or q in (r['sender'] or '').lower() or q in (r['contact'] or '').lower() or q in (r['service'] or '').lower()) and (not campaign or r['campaign']==campaign) and (not priority or r['priority']==priority)]
-    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Prospectos DT</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}input,select,button{padding:9px;margin:4px}.tag{display:inline-block;background:#e8f1f8;padding:4px;border-radius:5px;margin:2px}.btn{background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none}</style><a class="btn" href="/dashboard">← Visor</a> <a class="btn" href="/dashboard/prospects.csv">CSV</a><h1>Prospectos comerciales</h1><form><input name="q" placeholder="Contacto, teléfono o servicio" value="'+html.escape(request.args.get('q',''))+'"><input name="campaign" placeholder="Campaña" value="'+html.escape(campaign)+'"><select name="priority"><option value="">Todas las prioridades</option>'+''.join(f'<option {"selected" if x==priority else ""}>{x}</option>' for x in ('Urgente','Alta','Media','Baja'))+'</select><button>Filtrar</button></form>']
+    rows=[r for r in rows if (not q or q in (r['sender'] or '').lower() or q in (r['contact'] or '').lower() or q in (r['service'] or '').lower()) and (not campaign or r['campaign']==campaign) and (not priority or r['priority']==priority) and (not pending or is_follow_up_pending(r))]
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Prospectos DT</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}.warning{background:#fff3cd;border:1px solid #e0a800;padding:14px;border-radius:8px}input,select,button{padding:9px;margin:4px}.tag{display:inline-block;background:#e8f1f8;padding:4px;border-radius:5px;margin:2px}.follow{font-weight:bold}.overdue{color:#b42318}.soon{color:#9a6700}.btn{background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none}</style><a class="btn" href="/dashboard">← Visor</a> <a class="btn" href="/dashboard/prospects.csv">CSV</a><h1>Prospectos comerciales</h1><div class="warning">⚠️ <b>Revisión manual requerida:</b> los seguimientos solo son información de apoyo. No se envían mensajes automáticamente.</div><form><input name="q" placeholder="Contacto, teléfono o servicio" value="'+html.escape(request.args.get('q',''))+'"><input name="campaign" placeholder="Campaña" value="'+html.escape(campaign)+'"><select name="priority"><option value="">Todas las prioridades</option>'+''.join(f'<option {"selected" if x==priority else ""}>{x}</option>' for x in ('Urgente','Alta','Media','Baja'))+'</select><label><input type="checkbox" name="pending" value="1" '+('checked' if pending else '')+'> Seguimiento pendiente</label><button>Filtrar</button></form>']
     for r in rows:
-        status=r['status'] or 'Nuevo'; out.append(f'<div class="card"><b>{html.escape(r["contact"] or "Sin contacto")}</b> · {html.escape(r["sender"]) }<br><span class="tag">{html.escape(r["service"] or "Por definir")}</span><span class="tag">{html.escape(r["campaign"] or "Sin campaña")}</span><span class="tag">{html.escape(r["priority"])}</span><br>Estado: <form method="post" style="display:inline"><input type="hidden" name="id" value="{html.escape(r["id"])}"><select name="status">'+''.join(f'<option {"selected" if x==status else ""}>{x}</option>' for x in ('Nuevo','Contactado','Cotización pendiente','Cotizado','En negociación','Ganado','Perdido','Seguimiento'))+'</select><button>Guardar</button></form><br><small>{html.escape((r["details"] or "")[:500])}</small></div>')
+        status=r['status'] or 'Nuevo'; follow_state=follow_up_state(r['follow_up_at'],status); follow_class='overdue' if follow_state=='Vencido' else ('soon' if follow_state=='Próximo' else '')
+        follow_text=(f'Seguimiento: <span class="follow {follow_class}">{html.escape(follow_state)} · {html.escape(format_dt(r["follow_up_at"]))}</span>') if r['follow_up_at'] else 'Seguimiento: sin fecha'
+        out.append(f'<div class="card"><b>{html.escape(r["contact"] or "Sin contacto")}</b> · {html.escape(r["sender"]) }<br><span class="tag">{html.escape(r["service"] or "Por definir")}</span><span class="tag">{html.escape(r["campaign"] or "Sin campaña")}</span><span class="tag">{html.escape(r["priority"])}</span><br>{follow_text}<br>Estado: <form method="post" style="display:inline"><input type="hidden" name="id" value="{html.escape(r["id"])}"><select name="status">'+''.join(f'<option {"selected" if x==status else ""}>{x}</option>' for x in ('Nuevo','Contactado','Cotización pendiente','Cotizado','En negociación','Ganado','Perdido','Seguimiento'))+'</select><button>Guardar</button></form><br><small>{html.escape((r["details"] or "")[:500])}</small></div>')
     if not rows: out.append('<div class="card">No hay prospectos.</div>')
+    return ''.join(out)
+
+CONTENT_STATUSES = ('Borrador', 'Pendiente de aprobación', 'Aprobado', 'Publicado')
+
+@app.route('/dashboard/content', methods=['GET', 'POST'])
+def content_dashboard():
+    """Supervised content workspace; stores/previews copy only, never publishes."""
+    if not authorized(request): return login()
+    now = datetime.now(timezone.utc).isoformat()
+    if request.method == 'POST':
+        action, item_id = request.form.get('action', 'save'), request.form.get('id', '').strip()
+        if action == 'status' and item_id:
+            status = request.form.get('status', 'Borrador').strip()
+            if status in CONTENT_STATUSES:
+                c=db(); c.execute('UPDATE content_items SET status=?,updated_at=? WHERE id=?',(status,now,item_id)); c.commit(); c.close()
+            return redirect('/dashboard/content')
+        title=request.form.get('title','').strip(); copy_text=request.form.get('copy','').strip(); channel=request.form.get('channel','').strip(); campaign=request.form.get('campaign','').strip(); scheduled=request.form.get('scheduled_at','').strip() or None
+        if not title or not copy_text or not channel: return Response('Título, texto y canal son obligatorios',400)
+        c=db()
+        if item_id: c.execute('UPDATE content_items SET title=?,"copy"=?,channel=?,campaign=?,scheduled_at=?,updated_at=? WHERE id=?',(title,copy_text,channel,campaign,scheduled,now,item_id))
+        else: c.execute('INSERT INTO content_items(id,title,"copy",channel,campaign,status,scheduled_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,title,copy_text,channel,campaign,'Borrador',scheduled,now,now))
+        c.commit(); c.close(); return redirect('/dashboard/content')
+    edit_id=request.args.get('edit','').strip(); c=db(); rows=c.execute('SELECT id,title,"copy",channel,campaign,status,scheduled_at,created_at,updated_at FROM content_items ORDER BY updated_at DESC').fetchall(); editing=next((r for r in rows if r['id']==edit_id),None); c.close()
+    def v(k): return html.escape(str((editing[k] if editing else '') or ''),quote=True)
+    eid=html.escape(editing['id'],quote=True) if editing else ''
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Contenidos orgánicos - DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8;color:#1f2937}.card,.editor{background:white;padding:16px;margin:12px 0;border-radius:8px;max-width:900px}.btn,button{background:#075e9b;color:white;padding:9px 13px;border:0;border-radius:6px;text-decoration:none;margin:4px}.muted{color:#667085}.preview{background:#f8fafc;border:1px solid #d0d5dd;padding:12px;white-space:pre-wrap;border-radius:6px}input,select,textarea{padding:9px;margin:4px 0;width:95%;box-sizing:border-box}textarea{min-height:130px}</style><a class="btn" href="/dashboard">← Visor</a><h1>Contenidos orgánicos</h1><p class="muted">Flujo supervisado: solo guarda, revisa y aprueba textos. No se publica nada automáticamente.</p><div class="editor"><h2>'+('Editar contenido' if editing else 'Nuevo contenido')+'</h2><form method="post"><input type="hidden" name="id" value="'+eid+'"><label>Título<br><input name="title" required value="'+v('title')+'"></label><br><label>Texto / copy<br><textarea name="copy" required>'+v('copy')+'</textarea></label><br><label>Canal<br><input name="channel" required placeholder="Instagram, Facebook..." value="'+v('channel')+'"></label><br><label>Campaña (opcional)<br><input name="campaign" value="'+v('campaign')+'"></label><br><label>Fecha programada (referencia)<br><input type="datetime-local" name="scheduled_at" value="'+v('scheduled_at')+'"></label><br><button>Guardar borrador</button>'+(' <a class="btn" href="/dashboard/content">Cancelar</a>' if editing else '')+'</form></div>']
+    for r in rows:
+        sid=html.escape(r['id'],quote=True); opts=''.join('<option '+('selected' if x==r['status'] else '')+'>'+x+'</option>' for x in CONTENT_STATUSES)
+        out.append('<div class="card"><h2>'+html.escape(r['title'])+'</h2><p><b>Canal:</b> '+html.escape(r['channel'])+' · <b>Campaña:</b> '+html.escape(r['campaign'] or '—')+' · <b>Estado:</b> '+html.escape(r['status'] or 'Borrador')+'</p><p><b>Vista previa:</b></p><div class="preview">'+html.escape(r['copy'])+'</div><p class="muted">Programado: '+html.escape(r['scheduled_at'] or 'Sin fecha')+' · Actualizado: '+html.escape(format_dt(r['updated_at']))+'</p><a class="btn" href="/dashboard/content?edit='+sid+'">Editar</a><form method="post" style="display:inline"><input type="hidden" name="action" value="status"><input type="hidden" name="id" value="'+sid+'"><select name="status">'+opts+'</select><button>Cambiar estado</button></form></div>')
+    if not rows: out.append('<div class="card">No hay contenidos. Crea el primer borrador.</div>')
     return ''.join(out)
 
 @app.get('/dashboard/stats')
@@ -492,7 +633,7 @@ def dashboard():
     rows=[r for r in rows if (not q or q in r['sender'].lower()) and (not status_filter or get_status(r['sender'])==status_filter)]
     q_safe=html.escape(request.args.get('q','')); status_safe=html.escape(status_filter)
     opts=''.join(f'<option {"selected" if x==status_filter else ""}>{x}</option>' for x in ('','Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
-    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}input,select,button{padding:9px;margin:4px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><form method="get"><input name="q" placeholder="Buscar por teléfono" value="'+q_safe+'"><select name="status">'+opts+'</select><button>Filtrar</button> <a href="/dashboard">Limpiar</a></form><div class="actions"><a class="btn" href="/dashboard/stats">📊 Estadísticas comerciales</a><a class="btn" href="/dashboard/prospects">👥 Prospectos</a><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a><a class="btn" href="/dashboard/prospects.csv">⬇️ Descargar prospectos</a></div>']
+    out=['<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>DT Grúas</title><style>body{font-family:Arial;margin:24px;background:#f4f6f8}.card{background:white;padding:16px;margin:10px 0;border-radius:8px}a{color:#075e9b}.actions{margin:16px 0}.btn{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin-right:8px}input,select,button{padding:9px;margin:4px}</style><h1>DT Grúas y Montacargas</h1><p>Conversaciones</p><form method="get"><input name="q" placeholder="Buscar por teléfono" value="'+q_safe+'"><select name="status">'+opts+'</select><button>Filtrar</button> <a href="/dashboard">Limpiar</a></form><div class="actions"><a class="btn" href="/dashboard/stats">📊 Estadísticas comerciales</a><a class="btn" href="/dashboard/prospects">👥 Prospectos</a><a class="btn" href="/dashboard/content">📝 Contenidos orgánicos</a><a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><a class="btn" href="/dashboard/export.csv">⬇️ Descargar respaldo CSV</a><a class="btn" href="/dashboard/prospects.csv">⬇️ Descargar prospectos</a></div>']
     if not rows: out.append('<div class="card">No hay conversaciones que coincidan.</div>')
     for r in rows:
         status=html.escape(get_status(r['sender']))
