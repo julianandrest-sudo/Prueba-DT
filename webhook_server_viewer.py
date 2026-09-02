@@ -356,19 +356,6 @@ def save_prospect(sender, data):
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(uuid.uuid4().hex,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),priority,details,'Nuevo',follow_up_at,now,now)); c.commit(); c.close()
     except Exception as e: print('Error guardando prospecto:',e,flush=True)
 
-class _PreservePostRedirect(urllib.request.HTTPRedirectHandler):
-    """Apps Script returns 302; preserve POST and JSON across that redirect."""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if code in (301, 302, 303, 307, 308):
-            return urllib.request.Request(
-                newurl,
-                data=req.data,
-                headers=dict(req.headers),
-                method=req.get_method(),
-            )
-        return None
-
-
 def sync_prospect_to_sheets(prospect):
     """Forward one prospect to Apps Script without breaking the WhatsApp flow."""
     if not APPS_SCRIPT_WEBHOOK_URL:
@@ -384,8 +371,7 @@ def sync_prospect_to_sheets(prospect):
         method='POST'
     )
     try:
-        opener = urllib.request.build_opener(_PreservePostRedirect())
-        with opener.open(req, timeout=20) as response:
+        with urllib.request.urlopen(req, timeout=20) as response:
             body=response.read().decode('utf-8', errors='replace')
             if 200 <= response.status < 300:
                 return True, body[:500]
