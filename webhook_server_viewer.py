@@ -21,6 +21,8 @@ MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 DATABASE_URL = os.environ.get('DATABASE_URL','').strip()
 DASHBOARD_USER = os.environ.get('DASHBOARD_USER','admin')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD','')
+APPS_SCRIPT_WEBHOOK_URL = os.environ.get('APPS_SCRIPT_WEBHOOK_URL','').strip()
+APPS_SCRIPT_SYNC_TOKEN = os.environ.get('APPS_SCRIPT_SYNC_TOKEN','').strip()
 conversations = {}
 LOCAL_TZ = ZoneInfo('America/Bogota')
 
@@ -353,6 +355,40 @@ def save_prospect(sender, data):
         c=db(); c.execute('''INSERT INTO prospects(id,sender,contact,service,campaign,source,municipality,origin,destination,weight,dimensions,service_date,duration,operator,quoted_value,next_action,outcome,priority,details,status,follow_up_at,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(uuid.uuid4().hex,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),priority,details,'Nuevo',follow_up_at,now,now)); c.commit(); c.close()
     except Exception as e: print('Error guardando prospecto:',e,flush=True)
+
+def sync_prospect_to_sheets(prospect):
+    """Forward one prospect to Apps Script without breaking the WhatsApp flow."""
+    if not APPS_SCRIPT_WEBHOOK_URL:
+        return False, 'APPS_SCRIPT_WEBHOOK_URL no configurada'
+    payload = dict(prospect or {})
+    if APPS_SCRIPT_SYNC_TOKEN:
+        payload['token'] = APPS_SCRIPT_SYNC_TOKEN
+    req = urllib.request.Request(
+        APPS_SCRIPT_WEBHOOK_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            body=response.read().decode('utf-8', errors='replace')
+            if 200 <= response.status < 300:
+                return True, body[:500]
+            return False, f'HTTP {response.status}: {body[:300]}'
+    except Exception as error:
+        return False, str(error)[:300]
+
+@app.post('/marketing/sync-sheets')
+def marketing_sync_sheets():
+    data=request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return {'ok': False, 'error': 'JSON inválido'}, 400
+    # This endpoint is intended for controlled/admin integrations, not public chat traffic.
+    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
+    if APPS_SCRIPT_SYNC_TOKEN and expected != APPS_SCRIPT_SYNC_TOKEN:
+        return {'ok': False, 'error': 'No autorizado'}, 403
+    ok, detail=sync_prospect_to_sheets(data)
+    return {'ok': ok, 'detail': detail}, (200 if ok else 502)
 
 def finish_request(s, sender=''):
     d=s['data']; s['step']='done'
