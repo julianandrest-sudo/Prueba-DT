@@ -360,7 +360,8 @@ def sync_prospect_to_sheets(prospect):
     """Forward one prospect to Apps Script without breaking the WhatsApp flow."""
     if not APPS_SCRIPT_WEBHOOK_URL:
         return False, 'APPS_SCRIPT_WEBHOOK_URL no configurada'
-    payload = dict(prospect or {})
+    prospect_payload = dict(prospect or {})
+    payload = {'prospect': prospect_payload}
     if APPS_SCRIPT_SYNC_TOKEN:
         payload['token'] = APPS_SCRIPT_SYNC_TOKEN
     req = urllib.request.Request(
