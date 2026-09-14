@@ -408,7 +408,10 @@ def finish_request(s, sender=''):
     attached=f'\nArchivos adjuntos: {files}' if files else ''
     extra=f"\nInformación adicional: {d.get('additional_info','')}" if d.get('additional_info') else ''
     if not d.get('_prospect_saved'):
-        save_prospect(sender, d); d['_prospect_saved']=True
+        save_prospect(sender, d)
+        synced, sync_detail = sync_prospect_to_sheets(d)
+        print(f"Sincronización de prospecto a Sheets: {synced} — {sync_detail}", flush=True)
+        d['_prospect_saved']=True
     return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{attached}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
 
 def _process(sender,text):
