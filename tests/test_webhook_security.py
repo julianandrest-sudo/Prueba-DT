@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -242,6 +243,90 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertEqual(events[0][0], 'state')
         self.assertEqual(events[1], ('queue', events[0][1]))
         self.assertTrue(events[0][1])
+
+    def test_sync_endpoint_accepts_legacy_flat_payload_and_separate_inbound_secret(self):
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'inbound-secret'), \
+             patch.object(app_module, 'APPS_SCRIPT_SYNC_TOKEN', 'outbound-secret'), \
+             patch.object(app_module, 'enqueue_sheets_sync', return_value=(True, 'queued')) as enqueue_mock, \
+             patch.object(app_module, 'process_sheets_sync_queue', return_value={'ok': True, 'attempted': 1, 'synced': 1}):
+            response = self.client.post('/marketing/sync-sheets', json={
+                'sync_id': 'legacy-flat-1', 'name': 'Legacy', 'token': 'inbound-secret'
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['ok'])
+        args = enqueue_mock.call_args.args
+        self.assertEqual(args[0], 'legacy-flat-1')
+        self.assertEqual(args[1]['name'], 'Legacy')
+        self.assertNotIn('token', args[1])
+
+    def test_sync_endpoint_generates_id_for_legacy_payload_without_one(self):
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'inbound-secret'), \
+             patch.object(app_module, 'enqueue_sheets_sync', return_value=(True, 'queued')) as enqueue_mock, \
+             patch.object(app_module, 'process_sheets_sync_queue', return_value={'ok': True, 'attempted': 1, 'synced': 1}):
+            response = self.client.post('/marketing/sync-sheets', json={
+                'name': 'Legacy without id', 'token': 'inbound-secret'
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['sync_id_generated'])
+        generated_id = response.json['sync_id']
+        self.assertTrue(generated_id)
+        self.assertEqual(enqueue_mock.call_args.args[0], generated_id)
+        self.assertEqual(enqueue_mock.call_args.args[1]['name'], 'Legacy without id')
+
+    def test_sync_endpoint_reports_already_synced_as_success(self):
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'inbound-secret'), \
+             patch.object(app_module, 'enqueue_sheets_sync', return_value=(True, 'already_synced')), \
+             patch.object(app_module, 'process_sheets_sync_queue') as process_mock:
+            response = self.client.post('/marketing/sync-sheets', json={
+                'prospect': {'sync_id': 'already-done'}, 'token': 'inbound-secret'
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['ok'])
+        self.assertTrue(response.json['duplicate'])
+        self.assertEqual(response.json['status'], 'synced')
+        process_mock.assert_not_called()
+
+    def test_sync_endpoint_does_not_use_outbound_secret_for_inbound_auth(self):
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'inbound-secret'), \
+             patch.object(app_module, 'APPS_SCRIPT_SYNC_TOKEN', 'outbound-secret'), \
+             patch.object(app_module, 'enqueue_sheets_sync') as enqueue_mock:
+            response = self.client.post('/marketing/sync-sheets', json={
+                'prospect': {'sync_id': 'stable-1'}, 'token': 'outbound-secret'
+            })
+        self.assertEqual(response.status_code, 403)
+        enqueue_mock.assert_not_called()
+
+    def test_queue_claim_prevents_concurrent_duplicate_processing(self):
+        self.assertTrue(app_module.enqueue_sheets_sync('claim-1', {'sync_id': 'claim-1'})[0])
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = []
+        def slow_sync(payload):
+            calls.append(payload['sync_id'])
+            started.set()
+            self.assertTrue(release.wait(3))
+            return True, 'guardado confirmado'
+        with patch.object(app_module, 'sync_prospect_to_sheets', side_effect=slow_sync):
+            thread = threading.Thread(target=lambda: results.append(app_module.process_sheets_sync_queue(limit=1)))
+            thread.start()
+            self.assertTrue(started.wait(3))
+            second = app_module.process_sheets_sync_queue(limit=1)
+            self.assertEqual(second['attempted'], 0)
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, ['claim-1'])
+        self.assertEqual((results[0]['attempted'], results[0]['synced']), (1, 1))
+
+    def test_expired_processing_claim_is_recovered(self):
+        app_module.enqueue_sheets_sync('expired-1', {'sync_id': 'expired-1'})
+        c = app_module.db()
+        c.execute("UPDATE sheets_sync_queue SET status='processing',updated_at='2000-01-01T00:00:00+00:00' WHERE sync_id=?", ('expired-1',))
+        c.commit(); c.close()
+        with patch.object(app_module, 'sync_prospect_to_sheets', return_value=(True, 'guardado confirmado')):
+            result = app_module.process_sheets_sync_queue(limit=1)
+        self.assertEqual((result['attempted'], result['synced']), (1, 1))
 
     def test_retry_worker_runs_once_and_suppresses_backend_details(self):
         with patch.object(retry_worker, 'process_sheets_sync_queue', return_value={
