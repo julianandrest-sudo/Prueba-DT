@@ -110,6 +110,38 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertIn('no almacenamos archivos adjuntos', reply)
         self.assertNotIn('adjuntar fotos', reply.lower())
 
+    def test_admin_alert_retries_once_and_records_success(self):
+        class FakeResponse:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"messages":[{"id":"wamid.mock"}]}'
+
+        with patch.object(app_module, 'META_ACCESS_TOKEN', 'test-token'), \
+             patch.object(app_module, 'ADMIN_PHONE', '573000000000'), \
+             patch.object(app_module.urllib.request, 'urlopen', side_effect=[app_module.urllib.error.URLError('mock failure'), FakeResponse()]) as send_mock, \
+             patch.object(app_module.time, 'sleep'):
+            self.assertTrue(app_module.send_admin_alert('alerta simulada', '573001234567'))
+        self.assertEqual(send_mock.call_count, 2)
+        c = app_module.db()
+        row = c.execute('SELECT status,attempts,error FROM admin_alerts').fetchone()
+        self.assertEqual((row['status'], row['attempts'], row['error']), ('sent', 2, ''))
+        c.close()
+
+    def test_admin_alert_records_failure_after_two_attempts(self):
+        with patch.object(app_module, 'META_ACCESS_TOKEN', 'test-token'), \
+             patch.object(app_module, 'ADMIN_PHONE', '573000000000'), \
+             patch.object(app_module.urllib.request, 'urlopen', side_effect=app_module.urllib.error.URLError('mock failure')) as send_mock, \
+             patch.object(app_module.time, 'sleep'):
+            self.assertFalse(app_module.send_admin_alert('alerta simulada', '573001234567'))
+        self.assertEqual(send_mock.call_count, 2)
+        c = app_module.db()
+        row = c.execute('SELECT status,attempts,error FROM admin_alerts').fetchone()
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['attempts'], 2)
+        self.assertIn('mock failure', row['error'])
+        c.close()
+
     def test_failed_event_can_be_retried(self):
         self.assertTrue(app_module.claim_webhook_message('wamid.failed-test'))
         app_module.mark_webhook_message('wamid.failed-test', 'failed')
