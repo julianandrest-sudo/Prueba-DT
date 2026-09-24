@@ -286,6 +286,20 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertEqual(response.json['status'], 'synced')
         process_mock.assert_not_called()
 
+    def test_retry_endpoint_uses_outbound_token_after_inbound_token_is_separated(self):
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'legacy-inbound-secret'), \
+             patch.object(app_module, 'APPS_SCRIPT_SYNC_TOKEN', 'new-outbound-secret'), \
+             patch.object(app_module, 'process_sheets_sync_queue', return_value={'ok': True, 'attempted': 0, 'synced': 0}) as process_mock:
+            response = self.client.post('/marketing/retry-sheets',
+                headers={'X-Sync-Token': 'new-outbound-secret'}, json={'limit': 1})
+        self.assertEqual(response.status_code, 200)
+        process_mock.assert_called_once_with(limit=1)
+        with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'legacy-inbound-secret'), \
+             patch.object(app_module, 'APPS_SCRIPT_SYNC_TOKEN', 'new-outbound-secret'):
+            wrong = self.client.post('/marketing/retry-sheets',
+                headers={'X-Sync-Token': 'legacy-inbound-secret'}, json={'limit': 1})
+        self.assertEqual(wrong.status_code, 403)
+
     def test_sync_endpoint_does_not_use_outbound_secret_for_inbound_auth(self):
         with patch.object(app_module, 'MARKETING_SYNC_TOKEN', 'inbound-secret'), \
              patch.object(app_module, 'APPS_SCRIPT_SYNC_TOKEN', 'outbound-secret'), \
