@@ -58,6 +58,22 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(process_mock.call_count, 1)
 
+    def test_media_does_not_skip_pending_service_question(self):
+        event = {'entry': [{'changes': [{'value': {'messages': [
+            {'from': '573001234567', 'id': 'wamid.media-test', 'type': 'image', 'image': {'id': 'media-id'}}
+        ]}}]}]}
+        body = json.dumps(event, separators=(',', ':')).encode()
+        state = {'step': 'work', 'data': {'service': 'Alquiler de montacargas'}}
+        with patch.object(app_module, 'load_conversation_state', return_value=state), \
+             patch.object(app_module, 'save_conversation_state'), \
+             patch.object(app_module, 'save_attachment', return_value=('attach-id', 'downloaded', 'image.jpg')), \
+             patch.object(app_module, 'save'), \
+             patch.object(app_module, 'send_text', return_value=True), \
+             patch.object(app_module, 'send_admin_alert', return_value=True):
+            response = self.client.post('/webhook', data=body, headers=self.signed_headers(body))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(app_module.conversations['573001234567']['step'], 'work')
+
     def test_failed_event_can_be_retried(self):
         self.assertTrue(app_module.claim_webhook_message('wamid.failed-test'))
         app_module.mark_webhook_message('wamid.failed-test', 'failed')
