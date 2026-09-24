@@ -13,6 +13,7 @@ os.environ.setdefault('DASHBOARD_USER', 'tester')
 os.environ.setdefault('DASHBOARD_PASSWORD', 'strong-test-password')
 
 import webhook_server_viewer as app_module
+import sheets_sync_retry_worker as retry_worker
 
 
 class WebhookSecurityTests(unittest.TestCase):
@@ -241,6 +242,21 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertEqual(events[0][0], 'state')
         self.assertEqual(events[1], ('queue', events[0][1]))
         self.assertTrue(events[0][1])
+
+    def test_retry_worker_runs_once_and_suppresses_backend_details(self):
+        with patch.object(retry_worker, 'process_sheets_sync_queue', return_value={
+            'ok': True, 'attempted': 3, 'synced': 2
+        }) as process_mock, patch('builtins.print') as print_mock:
+            self.assertEqual(retry_worker.run_once(), 0)
+        process_mock.assert_called_once_with(limit=20)
+        print_mock.assert_called_once_with('Cola revisada: 3 pendientes; 2 sincronizados.', flush=True)
+
+        with patch.object(retry_worker, 'process_sheets_sync_queue', return_value={
+            'ok': False, 'error': 'secret details must not be logged'
+        }), patch('builtins.print') as print_mock:
+            self.assertEqual(retry_worker.run_once(), 1)
+        self.assertNotIn('secret details', str(print_mock.call_args))
+
 
 if __name__ == '__main__':
     unittest.main()
