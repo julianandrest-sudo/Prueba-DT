@@ -578,9 +578,9 @@ def _marketing_sync_token():
     return (MARKETING_SYNC_TOKEN or APPS_SCRIPT_SYNC_TOKEN).strip()
 
 
-def _marketing_request_authorized(data):
+def _marketing_request_authorized(data, token=None):
     expected=request.headers.get('X-Sync-Token','') or data.get('token','')
-    token=_marketing_sync_token()
+    token=(token if token is not None else _marketing_sync_token()).strip()
     return bool(token and expected and hmac.compare_digest(str(expected),token))
 
 
@@ -624,9 +624,9 @@ def marketing_retry_sheets():
     data=request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return {'ok':False,'error':'JSON inválido'},400
-    if not _marketing_sync_token():
+    if not APPS_SCRIPT_SYNC_TOKEN:
         return {'ok':False,'error':'Sincronización no configurada de forma segura'},503
-    if not _marketing_request_authorized(data):
+    if not _marketing_request_authorized(data,APPS_SCRIPT_SYNC_TOKEN):
         return {'ok':False,'error':'No autorizado'},403
     result=process_sheets_sync_queue(limit=data.get('limit',5))
     return result, (200 if result.get('ok') else 503)
