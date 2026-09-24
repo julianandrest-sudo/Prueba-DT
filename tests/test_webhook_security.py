@@ -71,21 +71,44 @@ class WebhookSecurityTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(process_mock.call_count, 1)
 
-    def test_media_does_not_skip_pending_service_question(self):
+    def test_media_is_not_downloaded_or_persisted_and_preserves_pending_question(self):
+        sender = '573001234567'
         event = {'entry': [{'changes': [{'value': {'messages': [
-            {'from': '573001234567', 'id': 'wamid.media-test', 'type': 'image', 'image': {'id': 'media-id'}}
+            {'from': sender, 'id': 'wamid.media-test', 'type': 'image', 'image': {
+                'id': 'customer-media-id-should-not-be-saved', 'filename': 'private-customer-file.pdf'
+            }}
         ]}}]}]}
         body = json.dumps(event, separators=(',', ':')).encode()
         state = {'step': 'work', 'data': {'service': 'Alquiler de montacargas'}}
         with patch.object(app_module, 'load_conversation_state', return_value=state), \
              patch.object(app_module, 'save_conversation_state'), \
-             patch.object(app_module, 'save_attachment', return_value=('attach-id', 'downloaded', 'image.jpg')), \
-             patch.object(app_module, 'save'), \
-             patch.object(app_module, 'send_text', return_value=True), \
-             patch.object(app_module, 'send_admin_alert', return_value=True):
+             patch.object(app_module, 'save') as save_mock, \
+             patch.object(app_module.urllib.request, 'urlopen', side_effect=AssertionError('attachment download attempted')) as download_mock, \
+             patch.object(app_module, 'send_text', return_value=True) as send_mock, \
+             patch.object(app_module, 'send_admin_alert', return_value=True) as alert_mock:
             response = self.client.post('/webhook', data=body, headers=self.signed_headers(body))
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(app_module.conversations['573001234567']['step'], 'work')
+        self.assertEqual(app_module.conversations[sender]['step'], 'work')
+        self.assertNotIn('attachments', state['data'])
+        download_mock.assert_not_called()
+        generic_notice = '📎 El cliente envió un adjunto; no se almacenó por privacidad.'
+        save_mock.assert_any_call(sender, 'in', generic_notice, 'received')
+        self.assertIn('Por privacidad no almacenamos archivos adjuntos', send_mock.call_args.args[1])
+        self.assertNotIn('private-customer-file.pdf', alert_mock.call_args.args[0])
+        self.assertNotIn('customer-media-id-should-not-be-saved', alert_mock.call_args.args[0])
+        c = app_module.db()
+        self.assertEqual(c.execute('SELECT COUNT(*) FROM attachments').fetchone()[0], 0)
+        c.close()
+
+    def test_attachment_prompt_offers_text_instead_of_file_upload(self):
+        sender = '573001234567'
+        state = {'step': 'attachments_choice', 'data': {}}
+        with patch.object(app_module, 'load_conversation_state', return_value=state), \
+             patch.object(app_module, 'save_conversation_state'):
+            reply = app_module.process(sender, 'sí')
+        self.assertEqual(state['step'], 'additional_info')
+        self.assertIn('no almacenamos archivos adjuntos', reply)
+        self.assertNotIn('adjuntar fotos', reply.lower())
 
     def test_failed_event_can_be_retried(self):
         self.assertTrue(app_module.claim_webhook_message('wamid.failed-test'))

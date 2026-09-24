@@ -282,36 +282,6 @@ def authorized(req):
 
 def login(): return Response('Autenticación requerida',401,{'WWW-Authenticate':'Basic realm="DT Gruas"'})
 
-def save_attachment(sender, media_id, kind, filename=''):
-    attachment_id=uuid.uuid4().hex
-    created=datetime.now(timezone.utc).isoformat()
-    local_path=''; status='pending'; error=''
-    try:
-        if not META_ACCESS_TOKEN or not media_id: raise RuntimeError('Falta token o ID multimedia')
-        headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}'}
-        info_req=urllib.request.Request(f'https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}',headers=headers)
-        with urllib.request.urlopen(info_req,timeout=15) as r: info=json.loads(r.read().decode())
-        media_url=info.get('url')
-        if not media_url: raise RuntimeError('Meta no devolvió URL del archivo')
-        file_req=urllib.request.Request(media_url,headers=headers)
-        ext={'image':'jpg','video':'mp4','audio':'ogg','document':'bin'}.get(kind,'bin')
-        safe_name=filename.replace('/','_').replace('\\\\','_') if filename else f'{attachment_id}.{ext}'
-        target=MEDIA_DIR / f'{attachment_id}_{safe_name}'
-        with urllib.request.urlopen(file_req,timeout=30) as r:
-            length=r.headers.get('Content-Length')
-            if length and int(length)>20*1024*1024: raise RuntimeError('Archivo excede el límite de 20 MB')
-            content=r.read(20*1024*1024+1)
-            if len(content)>20*1024*1024: raise RuntimeError('Archivo excede el límite de 20 MB')
-            target.write_bytes(content)
-        local_path=str(target); status='downloaded'
-    except Exception as e:
-        error=str(e)[:500]; status='failed'
-        print('Error descargando adjunto:',error,flush=True)
-    try:
-        c=db(); c.execute('INSERT INTO attachments(id,sender,media_id,type,filename,local_path,status,error,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(attachment_id,sender,media_id,kind,filename,local_path,status,error,created)); c.commit(); c.close()
-    except Exception as e: print('Error registrando adjunto:',e,flush=True)
-    return attachment_id, status, local_path
-
 def log_outgoing_attachment(sender, kind, filename, local_path='', media_id='', status='sent', error=''):
     """Register an attachment sent from the dashboard without contacting a client."""
     try:
@@ -493,15 +463,13 @@ def finish_request(s, sender=''):
         detail='Solicitud: '+d['sale_details']
     else:
         detail='Visita: '+d.get('visit_details','')
-    files=len(d.get('attachments',[]))
-    attached=f'\nArchivos adjuntos: {files}' if files else ''
     extra=f"\nInformación adicional: {d.get('additional_info','')}" if d.get('additional_info') else ''
     if not d.get('_prospect_saved'):
         save_prospect(sender, d)
         synced, sync_detail = sync_prospect_to_sheets(d)
         print(f"Sincronización de prospecto a Sheets: {synced} — {sync_detail}", flush=True)
         d['_prospect_saved']=True
-    return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{attached}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
+    return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
 
 def _process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
@@ -553,12 +521,13 @@ def _process(sender,text):
         s['data']['dates_operator']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='attachments_choice':
         if low in {'si','sí','s'}:
-            s['step']='attachments'; return 'Envía la foto, video o documento que desees adjuntar.'
+            s['step']='additional_info'; return 'Por privacidad no almacenamos archivos adjuntos. Escribe aquí los datos importantes que quieras compartir por texto.'
         if low in {'no','n'}:
             return finish_request(s, sender)
-        return 'Por favor responde SI o NO.\n\n¿Deseas adjuntar fotos, videos o documentos?'
+        return 'Por favor responde SI o NO. ¿Deseas agregar información adicional por escrito?'
     if s['step']=='attachments':
-        return 'Archivo recibido. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
+        s['step']='additional_info'
+        return 'Por privacidad no almacenamos archivos adjuntos. Escribe aquí los datos importantes que quieras compartir por texto; si no deseas agregar nada, responde NO.'
     if s['step']=='additional_choice':
         if low in {'si','sí','s'}:
             s['step']='additional_info'; return 'Escribe la información adicional que deseas agregar.'
@@ -566,10 +535,14 @@ def _process(sender,text):
             return finish_request(s, sender)
         return 'Por favor responde SI o NO. ¿Deseas agregar alguna información adicional?'
     if s['step']=='additional_info':
+        if low in {'no','n'}:
+            return finish_request(s, sender)
+        if low in {'si','sí','s'}:
+            return 'Escribe aquí la información importante que quieras agregar por texto.'
         s['data']['additional_info']=text; return finish_request(s, sender)
     if s['step']=='contact':
         s['data']['contact']=text; s['step']='attachments_choice'
-        return '¿Deseas adjuntar fotos, videos o documentos para complementar tu solicitud? Responde SI o NO.'
+        return '¿Deseas agregar información adicional por escrito? Responde SI o NO. Por privacidad no almacenamos archivos adjuntos.'
     if s['step']=='service':
         s['data']['service_details']=text; s['step']='contact'; return '¿Cuál es tu nombre, empresa y teléfono de contacto?'
     if s['step']=='sale':
@@ -626,22 +599,18 @@ def webhook():
                             text=m.get('text',{}).get('body','')
                             reply=process(sender,text)
                         else:
-                            media=m.get(kind,{}) or {}; filename=media.get('filename',''); media_id=media.get('id','')
-                            text=f'📎 Archivo recibido: {kind}'+(f' ({filename})' if filename else '')
+                            # Do not fetch, persist, or log customer-supplied attachment details.
+                            text='📎 El cliente envió un adjunto; no se almacenó por privacidad.'
                             conversations[sender]=load_conversation_state(sender)
                             state=conversations[sender]
-                            state.setdefault('data',{}).setdefault('attachments',[]).append({'type':kind,'id':media_id,'filename':filename})
-                            attachment_id,attachment_status,attachment_path=save_attachment(sender,media_id,kind,filename)
                             current_step=state.get('step','menu')
-                            if current_step=='attachments':
-                                state['step']='additional_choice'
-                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar información adicional? Responde SI o NO.'
-                            elif current_step=='additional_choice':
-                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar información adicional? Responde SI o NO.'
+                            if current_step in ('attachments','attachments_choice','additional_choice'):
+                                state['step']='additional_info'
+                                reply='Por privacidad no almacenamos archivos adjuntos. Si quieres incluir información importante de la foto o documento, escríbela aquí; si no, responde NO.'
                             elif current_step=='additional_info':
-                                reply='Recibimos el archivo correctamente 📎. Puedes continuar escribiendo la información adicional.'
+                                reply='Por privacidad no almacenamos archivos adjuntos. Escribe aquí cualquier dato importante que quieras agregar o responde NO para finalizar.'
                             else:
-                                reply='Recibimos el archivo correctamente 📎. Continuemos con la pregunta pendiente de tu solicitud.'
+                                reply='Por privacidad no almacenamos archivos adjuntos. Si contienen información importante para tu solicitud, descríbela aquí y continuemos con la pregunta pendiente.'
                             save_conversation_state(sender,state)
                         if 'En cualquier momento escribe MENU' not in reply:
                             reply += '\n\n↩️ Menú principal: escribe 0 o MENU PRINCIPAL.'
@@ -654,7 +623,7 @@ def webhook():
                             service=state.get('data',{}).get('service','Por definir')
                             received_at=format_dt(datetime.now(timezone.utc).isoformat())
                             reason=('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))
-                            type_label={'text':'Texto','image':'Imagen','video':'Video','document':'Documento','audio':'Audio'}.get(kind,kind)
+                            type_label='Texto' if kind=='text' else 'Adjunto no almacenado'
                             alert=('🔔 NUEVA SOLICITUD — DT GRÚAS\n\n'
                                    +'📅 Fecha y hora: '+received_at+'\n'
                                    +'📱 Cliente: '+sender+'\n'
