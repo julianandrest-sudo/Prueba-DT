@@ -27,6 +27,8 @@ DASHBOARD_USER = os.environ.get('DASHBOARD_USER','admin')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD','')
 APPS_SCRIPT_WEBHOOK_URL = os.environ.get('APPS_SCRIPT_WEBHOOK_URL','').strip()
 APPS_SCRIPT_SYNC_TOKEN = os.environ.get('APPS_SCRIPT_SYNC_TOKEN','').strip()
+# Keep inbound admin callers stable while the outbound Apps Script token rotates.
+MARKETING_SYNC_TOKEN = os.environ.get('MARKETING_SYNC_TOKEN','').strip()
 conversations = {}
 LOCAL_TZ = ZoneInfo('America/Bogota')
 
@@ -450,38 +452,51 @@ def build_sheets_prospect_payload(sender, data, sync_id):
 
 
 def enqueue_sheets_sync(sync_id, payload):
-    """Persist one idempotent Sheets delivery job before attempting network I/O."""
+    """Persist one idempotent job and report its current state on duplicate enqueue."""
     sync_id = str(sync_id or '').strip()
     if not sync_id:
         return False, 'sync_id requerido'
     now = datetime.now(timezone.utc).isoformat()
     serialized = json.dumps(payload, ensure_ascii=False)
+    c = None
     try:
         c=db()
         c.execute('''INSERT INTO sheets_sync_queue(sync_id,payload,status,attempts,next_attempt_at,last_error,created_at,updated_at,synced_at)
             VALUES(?,?, 'pending', 0, ?, '', ?, ?, NULL) ON CONFLICT(sync_id) DO NOTHING''', (sync_id,serialized,now,now,now))
-        c.commit(); c.close()
+        row=c.execute('SELECT status FROM sheets_sync_queue WHERE sync_id=?',(sync_id,)).fetchone()
+        c.commit(); c.close(); c=None
+        status=row['status'] if row else 'pending'
+        if status == 'synced':
+            return True, 'already_synced'
+        if status == 'processing':
+            return True, 'processing'
         return True, 'queued'
     except Exception as e:
+        if c:
+            try: c.close()
+            except Exception: pass
         print('Error encolando sincronización a Sheets:',e,flush=True)
         return False, str(e)[:300]
 
 
 def process_sheets_sync_queue(limit=5, sync_id=None):
-    """Retry due durable jobs with exponential backoff; receiver dedupes by sync_id."""
+    """Claim due jobs atomically, retry with backoff, and reclaim expired claims."""
     try:
         limit=max(1,min(int(limit or 5),20))
     except (TypeError, ValueError):
         limit=5
     now_dt=datetime.now(timezone.utc)
     now=now_dt.isoformat()
+    expired_before=(now_dt-timedelta(minutes=15)).isoformat()
     try:
         c=db()
+        # Requests time out far sooner than this lease; reclaim only abandoned jobs.
+        c.execute("UPDATE sheets_sync_queue SET status='pending',next_attempt_at=?,last_error=CASE WHEN last_error='' THEN 'expired_processing_claim' ELSE last_error END,updated_at=? WHERE status='processing' AND updated_at<=?",(now,now,expired_before))
         if sync_id:
             rows=c.execute("SELECT sync_id,payload,attempts FROM sheets_sync_queue WHERE status='pending' AND next_attempt_at<=? AND sync_id=? ORDER BY created_at LIMIT ?",(now,str(sync_id),limit)).fetchall()
         else:
             rows=c.execute("SELECT sync_id,payload,attempts FROM sheets_sync_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,created_at LIMIT ?",(now,limit)).fetchall()
-        c.close()
+        c.commit(); c.close()
     except Exception as e:
         return {'ok':False,'attempted':0,'synced':0,'error':str(e)[:300]}
 
@@ -490,6 +505,21 @@ def process_sheets_sync_queue(limit=5, sync_id=None):
     results=[]
     for row in rows:
         row_id=str(row['sync_id'])
+        claimed_at=datetime.now(timezone.utc).isoformat()
+        claimed=False
+        c=None
+        try:
+            c=db()
+            claim=c.execute("UPDATE sheets_sync_queue SET status='processing',updated_at=? WHERE sync_id=? AND status='pending' AND next_attempt_at<=?",(claimed_at,row_id,now))
+            claimed=(claim.rowcount == 1)
+            c.commit(); c.close(); c=None
+        except Exception:
+            if c:
+                try: c.close()
+                except Exception: pass
+            continue
+        if not claimed:
+            continue
         attempted += 1
         try:
             payload=json.loads(row['payload'])
@@ -499,14 +529,14 @@ def process_sheets_sync_queue(limit=5, sync_id=None):
         updated=datetime.now(timezone.utc)
         c=db()
         if ok:
-            c.execute("UPDATE sheets_sync_queue SET status='synced',attempts=attempts+1,last_error='',updated_at=?,synced_at=? WHERE sync_id=? AND status='pending'",(updated.isoformat(),updated.isoformat(),row_id))
+            c.execute("UPDATE sheets_sync_queue SET status='synced',attempts=attempts+1,last_error='',updated_at=?,synced_at=? WHERE sync_id=? AND status='processing'",(updated.isoformat(),updated.isoformat(),row_id))
             synced += 1
             results.append({'sync_id':row_id,'status':'synced'})
         else:
             attempts=int(row['attempts'] or 0) + 1
             delay_seconds=min(21600,60 * (2 ** min(attempts - 1, 8)))
             next_attempt=(updated + timedelta(seconds=delay_seconds)).isoformat()
-            c.execute("UPDATE sheets_sync_queue SET attempts=?,next_attempt_at=?,last_error=?,updated_at=? WHERE sync_id=? AND status='pending'",(attempts,next_attempt,(detail or 'sync_failed')[:500],updated.isoformat(),row_id))
+            c.execute("UPDATE sheets_sync_queue SET status='pending',attempts=?,next_attempt_at=?,last_error=?,updated_at=? WHERE sync_id=? AND status='processing'",(attempts,next_attempt,(detail or 'sync_failed')[:500],updated.isoformat(),row_id))
             results.append({'sync_id':row_id,'status':'pending','attempts':attempts,'next_attempt_at':next_attempt})
         c.commit(); c.close()
     return {'ok':True,'attempted':attempted,'synced':synced,'results':results}
@@ -543,28 +573,50 @@ def sync_prospect_to_sheets(prospect):
     except Exception as error:
         return False, str(error)[:300]
 
+def _marketing_sync_token():
+    """Separate inbound admin authentication from the outbound Apps Script token."""
+    return (MARKETING_SYNC_TOKEN or APPS_SCRIPT_SYNC_TOKEN).strip()
+
+
+def _marketing_request_authorized(data):
+    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
+    token=_marketing_sync_token()
+    return bool(token and expected and hmac.compare_digest(str(expected),token))
+
+
 @app.post('/marketing/sync-sheets')
 def marketing_sync_sheets():
     data=request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return {'ok': False, 'error': 'JSON inválido'}, 400
-    if not APPS_SCRIPT_SYNC_TOKEN:
+    if not _marketing_sync_token():
         return {'ok': False, 'error': 'Sincronización no configurada de forma segura'}, 503
-    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
-    if not hmac.compare_digest(str(expected), APPS_SCRIPT_SYNC_TOKEN):
+    if not _marketing_request_authorized(data):
         return {'ok': False, 'error': 'No autorizado'}, 403
-    prospect=data.get('prospect')
-    if not isinstance(prospect, dict):
-        return {'ok':False,'error':' prospect debe ser un objeto'},400
-    sync_id=str(prospect.get('sync_id') or '').strip()
-    if not sync_id:
-        return {'ok':False,'error':'sync_id requerido para evitar duplicados'},400
+    if 'prospect' in data:
+        prospect=data.get('prospect')
+        if not isinstance(prospect, dict):
+            return {'ok':False,'error':'prospect debe ser un objeto'},400
+        prospect=dict(prospect)
+    else:
+        # Preserve the legacy flat JSON shape while excluding its auth token.
+        prospect={key:value for key,value in data.items() if key != 'token'}
+    sync_id=str(prospect.get('sync_id') or request.headers.get('Idempotency-Key','')).strip()
+    generated_sync_id=not bool(sync_id)
+    if generated_sync_id:
+        # Keep legacy callers working; new callers should send an Idempotency-Key.
+        sync_id=uuid.uuid4().hex
+    prospect['sync_id']=sync_id
     queued,detail=enqueue_sheets_sync(sync_id,prospect)
     if not queued:
         return {'ok':False,'error':detail},500
+    if detail == 'already_synced':
+        return {'ok':True,'duplicate':True,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'synced','detail':'ya registrado'},200
+    if detail == 'processing':
+        return {'ok':False,'duplicate':False,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'processing','detail':'ya está en proceso'},202
     result=process_sheets_sync_queue(limit=1,sync_id=sync_id)
     synced=bool(result.get('synced'))
-    return {'ok':synced,'sync_id':sync_id,'status':'synced' if synced else 'pending','detail':result}, (200 if synced else 202)
+    return {'ok':synced,'duplicate':False,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'synced' if synced else 'pending','detail':result}, (200 if synced else 202)
 
 
 @app.post('/marketing/retry-sheets')
@@ -572,10 +624,9 @@ def marketing_retry_sheets():
     data=request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return {'ok':False,'error':'JSON inválido'},400
-    if not APPS_SCRIPT_SYNC_TOKEN:
+    if not _marketing_sync_token():
         return {'ok':False,'error':'Sincronización no configurada de forma segura'},503
-    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
-    if not hmac.compare_digest(str(expected),APPS_SCRIPT_SYNC_TOKEN):
+    if not _marketing_request_authorized(data):
         return {'ok':False,'error':'No autorizado'},403
     result=process_sheets_sync_queue(limit=data.get('limit',5))
     return result, (200 if result.get('ok') else 503)
