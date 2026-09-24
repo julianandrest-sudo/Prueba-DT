@@ -1,0 +1,34 @@
+name: Retry pending Sheets sync
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sheets-sync-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    # Keep the schedule inert until the token cutover is verified.
+    if: ${{ vars.SHEETS_SYNC_AUTOMATION_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Retry queued Google Sheets deliveries
+        env:
+          APPS_SCRIPT_SYNC_TOKEN: ${{ secrets.APPS_SCRIPT_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${APPS_SCRIPT_SYNC_TOKEN:-}"
+          curl --silent --show-error --fail --max-time 60 --output /dev/null \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --header "X-Sync-Token: ${APPS_SCRIPT_SYNC_TOKEN}" \
+            --data '{"limit":20}' \
+            'https://dt-gruas-webhook.onrender.com/marketing/retry-sheets'

@@ -27,6 +27,8 @@ DASHBOARD_USER = os.environ.get('DASHBOARD_USER','admin')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD','')
 APPS_SCRIPT_WEBHOOK_URL = os.environ.get('APPS_SCRIPT_WEBHOOK_URL','').strip()
 APPS_SCRIPT_SYNC_TOKEN = os.environ.get('APPS_SCRIPT_SYNC_TOKEN','').strip()
+# Keep inbound admin callers stable while the outbound Apps Script token rotates.
+MARKETING_SYNC_TOKEN = os.environ.get('MARKETING_SYNC_TOKEN','').strip()
 conversations = {}
 LOCAL_TZ = ZoneInfo('America/Bogota')
 
@@ -132,6 +134,8 @@ def db():
         c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
         c.execute("CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Nuevo', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        c.execute("CREATE TABLE IF NOT EXISTS sheets_sync_queue (sync_id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, synced_at TEXT)")
+        c.execute('CREATE INDEX IF NOT EXISTS idx_sheets_sync_queue_due ON sheets_sync_queue(status,next_attempt_at)')
         c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
         for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
             c.execute(f'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS {col} TEXT')
@@ -148,6 +152,8 @@ def db():
     c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
     c.execute("CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Nuevo', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    c.execute("CREATE TABLE IF NOT EXISTS sheets_sync_queue (sync_id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, synced_at TEXT)")
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sheets_sync_queue_due ON sheets_sync_queue(status,next_attempt_at)')
     c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
         try: c.execute(f'ALTER TABLE prospects ADD COLUMN {col} TEXT')
@@ -403,24 +409,149 @@ def prospect_priority(text, completed=False):
     if completed: return 'Alta'
     return 'Media'
 
-def save_prospect(sender, data):
+def save_prospect(sender, data, prospect_id=None):
+    """Idempotently persist a prospect under the stable Sheets sync identifier."""
+    sync_id = str(prospect_id or (data or {}).get('_prospect_sync_id') or uuid.uuid4().hex)
     now=datetime.now(timezone.utc).isoformat()
     details=json.dumps(data, ensure_ascii=False)
     try:
         priority=prospect_priority(details, True)
         follow_up_at=data.get('follow_up_at') or calculate_follow_up_at(priority)
         c=db(); c.execute('''INSERT INTO prospects(id,sender,contact,service,campaign,source,municipality,origin,destination,weight,dimensions,service_date,duration,operator,quoted_value,next_action,outcome,priority,details,status,follow_up_at,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(uuid.uuid4().hex,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),priority,details,'Nuevo',follow_up_at,now,now)); c.commit(); c.close()
-    except Exception as e: print('Error guardando prospecto:',e,flush=True)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING''',
+            (sync_id,sender,data.get('contact',''),data.get('service','Por definir'),data.get('campaign',''),data.get('source','WhatsApp'),data.get('municipality',''),data.get('origin',''),data.get('destination',''),data.get('weight',''),data.get('dimensions',''),data.get('service_date',''),data.get('duration',''),data.get('operator',''),data.get('quoted_value',''),data.get('next_action',''),data.get('outcome',''),priority,details,'Nuevo',follow_up_at,now,now)); c.commit(); c.close()
+    except Exception as e:
+        print('Error guardando prospecto:',e,flush=True)
+    return sync_id
+
+
+def build_sheets_prospect_payload(sender, data, sync_id):
+    """Map the conversation state to the exact Apps Script Prospectos columns."""
+    details = json.dumps(data or {}, ensure_ascii=False)
+    service = (data or {}).get('service') or (data or {}).get('service_details') or (data or {}).get('sale_details') or (data or {}).get('visit_details') or ''
+    return {
+        'sync_id': str(sync_id),
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'name': (data or {}).get('contact', ''),
+        'company': (data or {}).get('company', ''),
+        'phone': sender or '',
+        'service': service,
+        'municipality': (data or {}).get('municipality') or (data or {}).get('work_location') or '',
+        'origin': (data or {}).get('origin', ''),
+        'destination': (data or {}).get('destination', ''),
+        'service_date': (data or {}).get('service_date', ''),
+        'source': (data or {}).get('source') or 'WhatsApp',
+        'priority': prospect_priority(details, True),
+        'status': (data or {}).get('status') or 'Nuevo',
+        'responsible': (data or {}).get('responsible', ''),
+        'quoted_value': (data or {}).get('quoted_value', ''),
+        'outcome': (data or {}).get('outcome', ''),
+        'next_action': (data or {}).get('next_action', ''),
+        'followup_date': (data or {}).get('followup_date') or (data or {}).get('follow_up_at') or '',
+    }
+
+
+def enqueue_sheets_sync(sync_id, payload):
+    """Persist one idempotent job and report its current state on duplicate enqueue."""
+    sync_id = str(sync_id or '').strip()
+    if not sync_id:
+        return False, 'sync_id requerido'
+    now = datetime.now(timezone.utc).isoformat()
+    serialized = json.dumps(payload, ensure_ascii=False)
+    c = None
+    try:
+        c=db()
+        c.execute('''INSERT INTO sheets_sync_queue(sync_id,payload,status,attempts,next_attempt_at,last_error,created_at,updated_at,synced_at)
+            VALUES(?,?, 'pending', 0, ?, '', ?, ?, NULL) ON CONFLICT(sync_id) DO NOTHING''', (sync_id,serialized,now,now,now))
+        row=c.execute('SELECT status FROM sheets_sync_queue WHERE sync_id=?',(sync_id,)).fetchone()
+        c.commit(); c.close(); c=None
+        status=row['status'] if row else 'pending'
+        if status == 'synced':
+            return True, 'already_synced'
+        if status == 'processing':
+            return True, 'processing'
+        return True, 'queued'
+    except Exception as e:
+        if c:
+            try: c.close()
+            except Exception: pass
+        print('Error encolando sincronización a Sheets:',e,flush=True)
+        return False, str(e)[:300]
+
+
+def process_sheets_sync_queue(limit=5, sync_id=None):
+    """Claim due jobs atomically, retry with backoff, and reclaim expired claims."""
+    try:
+        limit=max(1,min(int(limit or 5),20))
+    except (TypeError, ValueError):
+        limit=5
+    now_dt=datetime.now(timezone.utc)
+    now=now_dt.isoformat()
+    expired_before=(now_dt-timedelta(minutes=15)).isoformat()
+    try:
+        c=db()
+        # Requests time out far sooner than this lease; reclaim only abandoned jobs.
+        c.execute("UPDATE sheets_sync_queue SET status='pending',next_attempt_at=?,last_error=CASE WHEN last_error='' THEN 'expired_processing_claim' ELSE last_error END,updated_at=? WHERE status='processing' AND updated_at<=?",(now,now,expired_before))
+        if sync_id:
+            rows=c.execute("SELECT sync_id,payload,attempts FROM sheets_sync_queue WHERE status='pending' AND next_attempt_at<=? AND sync_id=? ORDER BY created_at LIMIT ?",(now,str(sync_id),limit)).fetchall()
+        else:
+            rows=c.execute("SELECT sync_id,payload,attempts FROM sheets_sync_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,created_at LIMIT ?",(now,limit)).fetchall()
+        c.commit(); c.close()
+    except Exception as e:
+        return {'ok':False,'attempted':0,'synced':0,'error':str(e)[:300]}
+
+    attempted=0
+    synced=0
+    results=[]
+    for row in rows:
+        row_id=str(row['sync_id'])
+        claimed_at=datetime.now(timezone.utc).isoformat()
+        claimed=False
+        c=None
+        try:
+            c=db()
+            claim=c.execute("UPDATE sheets_sync_queue SET status='processing',updated_at=? WHERE sync_id=? AND status='pending' AND next_attempt_at<=?",(claimed_at,row_id,now))
+            claimed=(claim.rowcount == 1)
+            c.commit(); c.close(); c=None
+        except Exception:
+            if c:
+                try: c.close()
+                except Exception: pass
+            continue
+        if not claimed:
+            continue
+        attempted += 1
+        try:
+            payload=json.loads(row['payload'])
+            ok,detail=sync_prospect_to_sheets(payload)
+        except Exception as e:
+            ok,detail=False,str(e)[:300]
+        updated=datetime.now(timezone.utc)
+        c=db()
+        if ok:
+            c.execute("UPDATE sheets_sync_queue SET status='synced',attempts=attempts+1,last_error='',updated_at=?,synced_at=? WHERE sync_id=? AND status='processing'",(updated.isoformat(),updated.isoformat(),row_id))
+            synced += 1
+            results.append({'sync_id':row_id,'status':'synced'})
+        else:
+            attempts=int(row['attempts'] or 0) + 1
+            delay_seconds=min(21600,60 * (2 ** min(attempts - 1, 8)))
+            next_attempt=(updated + timedelta(seconds=delay_seconds)).isoformat()
+            c.execute("UPDATE sheets_sync_queue SET status='pending',attempts=?,next_attempt_at=?,last_error=?,updated_at=? WHERE sync_id=? AND status='processing'",(attempts,next_attempt,(detail or 'sync_failed')[:500],updated.isoformat(),row_id))
+            results.append({'sync_id':row_id,'status':'pending','attempts':attempts,'next_attempt_at':next_attempt})
+        c.commit(); c.close()
+    return {'ok':True,'attempted':attempted,'synced':synced,'results':results}
+
 
 def sync_prospect_to_sheets(prospect):
-    """Forward one prospect to Apps Script without breaking the WhatsApp flow."""
+    """Send one stable-id payload and require an explicit Apps Script success ack."""
     if not APPS_SCRIPT_WEBHOOK_URL:
         return False, 'APPS_SCRIPT_WEBHOOK_URL no configurada'
+    if not APPS_SCRIPT_SYNC_TOKEN:
+        return False, 'APPS_SCRIPT_SYNC_TOKEN no configurado'
     prospect_payload = dict(prospect or {})
-    payload = {'prospect': prospect_payload}
-    if APPS_SCRIPT_SYNC_TOKEN:
-        payload['token'] = APPS_SCRIPT_SYNC_TOKEN
+    if not str(prospect_payload.get('sync_id') or '').strip():
+        return False, 'sync_id requerido para idempotencia'
+    payload = {'prospect': prospect_payload, 'token': APPS_SCRIPT_SYNC_TOKEN}
     req = urllib.request.Request(
         APPS_SCRIPT_WEBHOOK_URL,
         data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
@@ -430,25 +561,76 @@ def sync_prospect_to_sheets(prospect):
     try:
         with urllib.request.urlopen(req, timeout=20) as response:
             body=response.read().decode('utf-8', errors='replace')
-            if 200 <= response.status < 300:
-                return True, body[:500]
-            return False, f'HTTP {response.status}: {body[:300]}'
+            if not 200 <= response.status < 300:
+                return False, f'HTTP {response.status}: {body[:300]}'
+            try:
+                result=json.loads(body)
+            except ValueError:
+                return False, 'Respuesta de Apps Script no es JSON válido'
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                return False, str(result.get('error') or 'Apps Script no confirmó la escritura')[:300] if isinstance(result, dict) else 'Respuesta inválida de Apps Script'
+            return True, 'duplicado ya registrado' if result.get('duplicate') else 'guardado confirmado'
     except Exception as error:
         return False, str(error)[:300]
+
+def _marketing_sync_token():
+    """Separate inbound admin authentication from the outbound Apps Script token."""
+    return (MARKETING_SYNC_TOKEN or APPS_SCRIPT_SYNC_TOKEN).strip()
+
+
+def _marketing_request_authorized(data, token=None):
+    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
+    token=(token if token is not None else _marketing_sync_token()).strip()
+    return bool(token and expected and hmac.compare_digest(str(expected),token))
+
 
 @app.post('/marketing/sync-sheets')
 def marketing_sync_sheets():
     data=request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return {'ok': False, 'error': 'JSON inválido'}, 400
-    # This endpoint is intended for controlled/admin integrations, not public chat traffic.
-    if not APPS_SCRIPT_SYNC_TOKEN:
+    if not _marketing_sync_token():
         return {'ok': False, 'error': 'Sincronización no configurada de forma segura'}, 503
-    expected=request.headers.get('X-Sync-Token','') or data.get('token','')
-    if not hmac.compare_digest(str(expected), APPS_SCRIPT_SYNC_TOKEN):
+    if not _marketing_request_authorized(data):
         return {'ok': False, 'error': 'No autorizado'}, 403
-    ok, detail=sync_prospect_to_sheets(data)
-    return {'ok': ok, 'detail': detail}, (200 if ok else 502)
+    if 'prospect' in data:
+        prospect=data.get('prospect')
+        if not isinstance(prospect, dict):
+            return {'ok':False,'error':'prospect debe ser un objeto'},400
+        prospect=dict(prospect)
+    else:
+        # Preserve the legacy flat JSON shape while excluding its auth token.
+        prospect={key:value for key,value in data.items() if key != 'token'}
+    sync_id=str(prospect.get('sync_id') or request.headers.get('Idempotency-Key','')).strip()
+    generated_sync_id=not bool(sync_id)
+    if generated_sync_id:
+        # Keep legacy callers working; new callers should send an Idempotency-Key.
+        sync_id=uuid.uuid4().hex
+    prospect['sync_id']=sync_id
+    queued,detail=enqueue_sheets_sync(sync_id,prospect)
+    if not queued:
+        return {'ok':False,'error':detail},500
+    if detail == 'already_synced':
+        return {'ok':True,'duplicate':True,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'synced','detail':'ya registrado'},200
+    if detail == 'processing':
+        return {'ok':False,'duplicate':False,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'processing','detail':'ya está en proceso'},202
+    result=process_sheets_sync_queue(limit=1,sync_id=sync_id)
+    synced=bool(result.get('synced'))
+    return {'ok':synced,'duplicate':False,'sync_id':sync_id,'sync_id_generated':generated_sync_id,'status':'synced' if synced else 'pending','detail':result}, (200 if synced else 202)
+
+
+@app.post('/marketing/retry-sheets')
+def marketing_retry_sheets():
+    data=request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return {'ok':False,'error':'JSON inválido'},400
+    if not APPS_SCRIPT_SYNC_TOKEN:
+        return {'ok':False,'error':'Sincronización no configurada de forma segura'},503
+    if not _marketing_request_authorized(data,APPS_SCRIPT_SYNC_TOKEN):
+        return {'ok':False,'error':'No autorizado'},403
+    result=process_sheets_sync_queue(limit=data.get('limit',5))
+    return result, (200 if result.get('ok') else 503)
+
 
 def finish_request(s, sender=''):
     d=s['data']; s['step']='done'
@@ -463,13 +645,25 @@ def finish_request(s, sender=''):
         detail='Solicitud: '+d['sale_details']
     else:
         detail='Visita: '+d.get('visit_details','')
+    files=len(d.get('attachments',[]))
+    attached=f'\nArchivos adjuntos: {files}' if files else ''
     extra=f"\nInformación adicional: {d.get('additional_info','')}" if d.get('additional_info') else ''
     if not d.get('_prospect_saved'):
-        save_prospect(sender, d)
-        synced, sync_detail = sync_prospect_to_sheets(d)
-        print(f"Sincronización de prospecto a Sheets: {synced} — {sync_detail}", flush=True)
-        d['_prospect_saved']=True
-    return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
+        sync_id=str(d.get('_prospect_sync_id') or uuid.uuid4().hex)
+        d['_prospect_sync_id']=sync_id
+        # Persist the id before either write so a repeated completion reuses it.
+        if sender:
+            save_conversation_state(sender,s)
+        save_prospect(sender,d,sync_id)
+        payload=build_sheets_prospect_payload(sender,d,sync_id)
+        queued,queue_detail=enqueue_sheets_sync(sync_id,payload)
+        if queued:
+            d['_prospect_saved']=True
+            result=process_sheets_sync_queue(limit=1,sync_id=sync_id)
+            print(f"Sincronización a Sheets {sync_id}: {result}", flush=True)
+        else:
+            print(f"No se pudo encolar la sincronización a Sheets {sync_id}: {queue_detail}", flush=True)
+    return f"✅ Gracias por la información.\n\n{detail}\nCliente: {d['contact']}{attached}{extra}\n\nYa un asesor de DT Grúas y Montacargas te atenderá."
 
 def _process(sender,text):
     text=(text or '').strip(); low=text.lower(); s=conversations.setdefault(sender,{'step':'menu','data':{}})
