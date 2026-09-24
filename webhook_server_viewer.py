@@ -1,8 +1,9 @@
-import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html, time, uuid, mimetypes, re
+import os, json, base64, sqlite3, urllib.request, urllib.error, csv, io, html, time, uuid, mimetypes, re, hmac, hashlib
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, Response, redirect, send_file
 from pathlib import Path
+from urllib.parse import urlsplit
 try:
     import psycopg2
     import psycopg2.extras
@@ -10,7 +11,10 @@ except ImportError:
     psycopg2 = None
 
 app = Flask(__name__)
+# Meta webhook payloads are small; the larger cap is for dashboard audio uploads.
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN','')
+META_APP_SECRET = os.environ.get('META_APP_SECRET','').strip()
 META_ACCESS_TOKEN = os.environ.get('META_ACCESS_TOKEN','')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID','1190081650863434')
 ADMIN_PHONE = os.environ.get('ADMIN_PHONE','573012108712')
@@ -114,24 +118,31 @@ WELCOME = ('¡Hola! Soy el asistente de DT Grúas y Montacargas 🚜🏗️\n\n'
 def db():
     if DATABASE_URL and psycopg2:
         c=PGConnection(DATABASE_URL)
-        c.execute('CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+        c.execute("CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, sender TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, delivery_status TEXT NOT NULL DEFAULT 'recorded', delivery_error TEXT NOT NULL DEFAULT '')")
+        c.execute('CREATE TABLE IF NOT EXISTS processed_webhook_messages (message_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+        c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'recorded'")
+        c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_error TEXT NOT NULL DEFAULT ''")
+        c.execute("CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'Nuevo')")
         c.execute('CREATE TABLE IF NOT EXISTS conversation_state (sender TEXT PRIMARY KEY, step TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+        c.execute("CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Nuevo', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
         for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
             c.execute(f'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS {col} TEXT')
         _backfill_follow_ups(c)
         c.commit(); return c
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
-    c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'Nuevo\')')
+    c.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, direction TEXT, body TEXT, created_at TEXT, delivery_status TEXT NOT NULL DEFAULT 'recorded', delivery_error TEXT NOT NULL DEFAULT '')")
+    for col,definition in (('delivery_status', "TEXT NOT NULL DEFAULT 'recorded'"), ('delivery_error', "TEXT NOT NULL DEFAULT ''")):
+        try: c.execute(f'ALTER TABLE messages ADD COLUMN {col} {definition}')
+        except sqlite3.OperationalError: pass
+    c.execute('CREATE TABLE IF NOT EXISTS processed_webhook_messages (message_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    c.execute("CREATE TABLE IF NOT EXISTS conversation_meta (sender TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'Nuevo')")
     c.execute('CREATE TABLE IF NOT EXISTS conversation_state (sender TEXT PRIMARY KEY, step TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL)')
     c.execute('CREATE TABLE IF NOT EXISTS admin_alerts (id TEXT PRIMARY KEY, sender TEXT, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, sent_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, sender TEXT NOT NULL, media_id TEXT, type TEXT NOT NULL, filename TEXT, local_path TEXT, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL)')
-    c.execute('CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'Nuevo\', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    c.execute("CREATE TABLE IF NOT EXISTS prospects (id TEXT PRIMARY KEY, sender TEXT NOT NULL, contact TEXT, service TEXT, campaign TEXT, source TEXT, municipality TEXT, origin TEXT, destination TEXT, weight TEXT, dimensions TEXT, service_date TEXT, duration TEXT, operator TEXT, quoted_value TEXT, next_action TEXT, outcome TEXT, priority TEXT NOT NULL, details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Nuevo', follow_up_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS content_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, \"copy\" TEXT NOT NULL, channel TEXT NOT NULL, campaign TEXT, status TEXT NOT NULL DEFAULT 'Borrador', scheduled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     for col in ('municipality','origin','destination','weight','dimensions','service_date','duration','operator','quoted_value','next_action','outcome','follow_up_at'):
         try: c.execute(f'ALTER TABLE prospects ADD COLUMN {col} TEXT')
@@ -173,10 +184,66 @@ def clear_conversation_state(sender):
     save_conversation_state(sender,state)
     return state
 
-def save(sender,direction,body):
+def save(sender,direction,body,delivery_status=None,delivery_error=''):
+    # Persist a message with an explicit transport state; never imply delivery.
+    status = delivery_status or ('received' if direction == 'in' else 'pending')
+    created = datetime.now(timezone.utc).isoformat()
+    c=db()
+    if isinstance(c, PGConnection):
+        row=c.execute('INSERT INTO messages(sender,direction,body,created_at,delivery_status,delivery_error) VALUES(?,?,?,?,?,?) RETURNING id',
+                      (sender,direction,body,created,status,delivery_error)).fetchone()
+        message_id=row['id'] if row else None
+    else:
+        cursor=c.execute('INSERT INTO messages(sender,direction,body,created_at,delivery_status,delivery_error) VALUES(?,?,?,?,?,?)',
+                         (sender,direction,body,created,status,delivery_error))
+        message_id=cursor.lastrowid
+    c.commit(); c.close()
+    return message_id
+
+
+def update_message_delivery(message_id,status,error=''):
+    if message_id is None: return
+    c=db(); c.execute('UPDATE messages SET delivery_status=?,delivery_error=? WHERE id=?',(status,(error or '')[:1000],message_id)); c.commit(); c.close()
+
+
+def claim_webhook_message(message_id):
+    # Atomically claim an inbound Meta message once; failed processing may retry.
+    now=datetime.now(timezone.utc).isoformat()
+    c=db()
+    cur=c.execute('INSERT INTO processed_webhook_messages(message_id,status,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(message_id) DO NOTHING',
+                  (message_id,'processing',now,now))
+    claimed=cur.rowcount == 1
+    if not claimed:
+        stale_before=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+        cur=c.execute('UPDATE processed_webhook_messages SET status=?,updated_at=? WHERE message_id=? AND (status=? OR (status=? AND updated_at<?))',
+                      ('processing',now,message_id,'failed','processing',stale_before))
+        claimed=cur.rowcount == 1
+    c.commit(); c.close()
+    return claimed
+
+
+def mark_webhook_message(message_id,status):
+    c=db(); c.execute('UPDATE processed_webhook_messages SET status=?,updated_at=? WHERE message_id=?',
+                      (status,datetime.now(timezone.utc).isoformat(),message_id)); c.commit(); c.close()
+
+
+def valid_meta_signature(raw_body, signature):
+    if not META_APP_SECRET or not signature:
+        return False
+    expected='sha256='+hmac.new(META_APP_SECRET.encode('utf-8'),raw_body,hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected,signature.strip())
+
+
+def same_origin_dashboard_post(req):
+    # Reject cross-site form submissions to Basic-authenticated dashboard actions.
+    source=req.headers.get('Origin') or req.headers.get('Referer','')
+    if not source:
+        return False
     try:
-        c=db(); c.execute('INSERT INTO messages(sender,direction,body,created_at) VALUES(?,?,?,?)',(sender,direction,body,datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
-    except Exception as e: print('Error guardando mensaje:',e,flush=True)
+        parsed=urlsplit(source)
+        return parsed.scheme == 'https' and parsed.netloc.lower() == req.host.lower()
+    except Exception:
+        return False
 
 def get_status(sender):
     try:
@@ -205,7 +272,7 @@ def authorized(req):
     h=req.headers.get('Authorization','')
     if not DASHBOARD_PASSWORD or not h.startswith('Basic '): return False
     try:
-        u,p=base64.b64decode(h[6:]).decode().split(':',1); return u==DASHBOARD_USER and p==DASHBOARD_PASSWORD
+        u,p=base64.b64decode(h[6:]).decode().split(':',1); return hmac.compare_digest(u,DASHBOARD_USER) and hmac.compare_digest(p,DASHBOARD_PASSWORD)
     except Exception: return False
 
 def login(): return Response('Autenticación requerida',401,{'WWW-Authenticate':'Basic realm="DT Gruas"'})
@@ -225,7 +292,12 @@ def save_attachment(sender, media_id, kind, filename=''):
         ext={'image':'jpg','video':'mp4','audio':'ogg','document':'bin'}.get(kind,'bin')
         safe_name=filename.replace('/','_').replace('\\\\','_') if filename else f'{attachment_id}.{ext}'
         target=MEDIA_DIR / f'{attachment_id}_{safe_name}'
-        with urllib.request.urlopen(file_req,timeout=30) as r: target.write_bytes(r.read())
+        with urllib.request.urlopen(file_req,timeout=30) as r:
+            length=r.headers.get('Content-Length')
+            if length and int(length)>20*1024*1024: raise RuntimeError('Archivo excede el límite de 20 MB')
+            content=r.read(20*1024*1024+1)
+            if len(content)>20*1024*1024: raise RuntimeError('Archivo excede el límite de 20 MB')
+            target.write_bytes(content)
         local_path=str(target); status='downloaded'
     except Exception as e:
         error=str(e)[:500]; status='failed'
@@ -265,36 +337,46 @@ def send_audio(to, filepath, filename):
     """Upload and send an audio file, logging both the message and attachment."""
     content_type=mimetypes.guess_type(filename)[0] or 'audio/ogg'
     if not content_type.startswith('audio/'): raise RuntimeError('El archivo debe ser un audio')
+    if os.path.getsize(filepath)>16*1024*1024: raise RuntimeError('El audio excede el límite de 16 MB')
     try:
         media_id=upload_media(filepath, content_type)
         url=f'https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages'
         payload=json.dumps({'messaging_product':'whatsapp','to':to,'type':'audio','audio':{'id':media_id}}).encode()
         req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req, timeout=15) as r: response=r.read().decode()
-        save(to,'out',f'🎧 Audio enviado: {filename}')
+        save(to,'out',f'🎧 Audio enviado: {filename}','accepted_by_meta')
         log_outgoing_attachment(to,'audio',filename,filepath,media_id,'sent','')
         print('Audio enviado',response,flush=True)
         return True
     except urllib.error.HTTPError as e:
         error=f'HTTP {e.code}: {e.read().decode(errors="replace")[:500]}'
     except Exception as e: error=str(e)[:500]
-    save(to,'out',f'🎧 Audio no enviado: {filename}')
+    save(to,'out',f'🎧 Audio no enviado: {filename}','failed',error)
     log_outgoing_attachment(to,'audio',filename,filepath,'','failed',error)
     print('Error enviando audio:',error,flush=True)
     return False
 
 def send_text(to,text):
-    save(to,'out',text)
-    if not META_ACCESS_TOKEN: return False
+    message_id=save(to,'out',text,'pending')
+    if not META_ACCESS_TOKEN:
+        update_message_delivery(message_id,'failed','Falta META_ACCESS_TOKEN')
+        return False
     url=f'https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages'
     recipient={'recipient':to} if isinstance(to,str) and '.' in to else {'to':to}
     payload=json.dumps({'messaging_product':'whatsapp','recipient_type':'individual',**recipient,'type':'text','text':{'preview_url':False,'body':text}}).encode()
     req=urllib.request.Request(url,data=payload,headers={'Authorization':f'Bearer {META_ACCESS_TOKEN}','Content-Type':'application/json'},method='POST')
     try:
-        with urllib.request.urlopen(req,timeout=15) as r: print('Meta',r.status,r.read().decode(),flush=True)
+        with urllib.request.urlopen(req,timeout=15) as r:
+            response=r.read().decode(errors='replace')
+            update_message_delivery(message_id,'accepted_by_meta')
+            print('Meta aceptó mensaje',r.status,response[:500],flush=True)
         return True
-    except urllib.error.HTTPError as e: print('Error Meta',e.code,e.read().decode(),flush=True)
-    except Exception as e: print('Error enviando',e,flush=True)
+    except urllib.error.HTTPError as e:
+        detail=f'HTTP {e.code}: {e.read().decode(errors="replace")[:800]}'
+    except Exception as e:
+        detail=str(e)[:800]
+    update_message_delivery(message_id,'failed',detail)
+    print('Error enviando mensaje:',detail,flush=True)
     return False
 
 def send_admin_alert(text, sender=''):
@@ -385,8 +467,10 @@ def marketing_sync_sheets():
     if not isinstance(data, dict):
         return {'ok': False, 'error': 'JSON inválido'}, 400
     # This endpoint is intended for controlled/admin integrations, not public chat traffic.
+    if not APPS_SCRIPT_SYNC_TOKEN:
+        return {'ok': False, 'error': 'Sincronización no configurada de forma segura'}, 503
     expected=request.headers.get('X-Sync-Token','') or data.get('token','')
-    if APPS_SCRIPT_SYNC_TOKEN and expected != APPS_SCRIPT_SYNC_TOKEN:
+    if not hmac.compare_digest(str(expected), APPS_SCRIPT_SYNC_TOKEN):
         return {'ok': False, 'error': 'No autorizado'}, 403
     ok, detail=sync_prospect_to_sheets(data)
     return {'ok': ok, 'detail': detail}, (200 if ok else 502)
@@ -500,19 +584,39 @@ def process(sender,text):
 
 @app.get('/webhook')
 def verify():
-    if request.args.get('hub.mode')=='subscribe' and request.args.get('hub.verify_token')==VERIFY_TOKEN: return request.args.get('hub.challenge',''),200
+    if not VERIFY_TOKEN: return 'Webhook verification is not configured',503
+    if request.args.get('hub.mode')=='subscribe' and hmac.compare_digest(request.args.get('hub.verify_token',''),VERIFY_TOKEN): return request.args.get('hub.challenge',''),200
     return 'Forbidden',403
 
 @app.post('/webhook')
 def webhook():
-    data=request.get_json(silent=True) or {}; print(json.dumps(data,ensure_ascii=False),flush=True)
+    raw_body=request.get_data(cache=True)
+    if not META_APP_SECRET:
+        print('Webhook rechazado: META_APP_SECRET no configurado',flush=True)
+        return 'Webhook security is not configured',503
+    if not valid_meta_signature(raw_body,request.headers.get('X-Hub-Signature-256','')):
+        return 'Invalid signature',401
+    try:
+        data=json.loads(raw_body.decode('utf-8'))
+    except (UnicodeDecodeError,ValueError):
+        return 'Invalid JSON',400
+    if not isinstance(data,dict):
+        return 'Invalid payload',400
     try:
         for entry in data.get('entry',[]):
             for change in entry.get('changes',[]):
                 for m in change.get('value',{}).get('messages',[]):
                     sender=m.get('from') or m.get('from_user_id')
-                    if sender and m.get('type') in ('text','image','video','document','audio'):
-                        kind=m.get('type')
+                    kind=m.get('type')
+                    if not sender or kind not in ('text','image','video','document','audio'):
+                        continue
+                    message_id=m.get('id')
+                    if not message_id:
+                        raise ValueError('Meta message is missing its id')
+                    if not claim_webhook_message(str(message_id)):
+                        print('Evento repetido ignorado',message_id,flush=True)
+                        continue
+                    try:
                         if kind=='text':
                             text=m.get('text',{}).get('body','')
                             reply=process(sender,text)
@@ -522,17 +626,22 @@ def webhook():
                             conversations[sender]=load_conversation_state(sender)
                             state=conversations[sender]
                             state.setdefault('data',{}).setdefault('attachments',[]).append({'type':kind,'id':media_id,'filename':filename})
-                            attachment_record, attachment_status, attachment_path=save_attachment(sender,media_id,kind,filename)
-                            if state.get('step') in ('attachments','additional_choice','additional_info'):
+                            attachment_id,attachment_status,attachment_path=save_attachment(sender,media_id,kind,filename)
+                            current_step=state.get('step','menu')
+                            if current_step=='attachments':
                                 state['step']='additional_choice'
-                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
+                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar información adicional? Responde SI o NO.'
+                            elif current_step=='additional_choice':
+                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar información adicional? Responde SI o NO.'
+                            elif current_step=='additional_info':
+                                reply='Recibimos el archivo correctamente 📎. Puedes continuar escribiendo la información adicional.'
                             else:
-                                reply='Recibimos el archivo correctamente 📎. ¿Deseas agregar alguna información adicional? Responde SI o NO.'
-                                state['step']='additional_choice'
-                            save_conversation_state(sender, state)
+                                reply='Recibimos el archivo correctamente 📎. Continuemos con la pregunta pendiente de tu solicitud.'
+                            save_conversation_state(sender,state)
                         if 'En cualquier momento escribe MENU' not in reply:
                             reply += '\n\n↩️ Menú principal: escribe 0 o MENU PRINCIPAL.'
-                        save(sender,'in',text); send_text(sender,reply)
+                        save(sender,'in',text,'received')
+                        send_text(sender,reply)
                         state=conversations.get(sender,{})
                         urgent=any(x in text.lower() for x in ('urgente','ya','hoy','parado','no funciona','emergencia'))
                         qualified=state.get('step') in ('done','advisor')
@@ -541,24 +650,32 @@ def webhook():
                             received_at=format_dt(datetime.now(timezone.utc).isoformat())
                             reason=('Solicitud urgente' if urgent else ('Solicitud completada' if qualified else 'Nuevo contacto'))
                             type_label={'text':'Texto','image':'Imagen','video':'Video','document':'Documento','audio':'Audio'}.get(kind,kind)
-                            alert=('🔔 NUEVA SOLICITUD — DT GRÚAS\\n\\n'
-                                   +'📅 Fecha y hora: '+received_at+'\\n'
-                                   +'📱 Cliente: '+sender+'\\n'
-                                   +'🛠️ Servicio: '+service+'\\n'
-                                   +'📎 Tipo de mensaje: '+type_label+'\\n'
-                                   +'📌 Estado: '+reason+'\\n'
-                                   +'💬 Mensaje recibido:\\n'+text+'\\n\\n'
+                            alert=('🔔 NUEVA SOLICITUD — DT GRÚAS\n\n'
+                                   +'📅 Fecha y hora: '+received_at+'\n'
+                                   +'📱 Cliente: '+sender+'\n'
+                                   +'🛠️ Servicio: '+service+'\n'
+                                   +'📎 Tipo de mensaje: '+type_label+'\n'
+                                   +'📌 Estado: '+reason+'\n'
+                                   +'💬 Mensaje recibido:\n'+text+'\n\n'
                                    +'🔎 Revisa la conversación en el visor: https://dt-gruas-webhook.onrender.com/dashboard')
-                            send_admin_alert(alert, sender)
-    except Exception as e: print('Error procesando:',e,flush=True)
+                            send_admin_alert(alert,sender)
+                        mark_webhook_message(str(message_id),'processed')
+                    except Exception as message_error:
+                        try: mark_webhook_message(str(message_id),'failed')
+                        except Exception: pass
+                        print('Error procesando mensaje entrante:',str(message_error)[:500],flush=True)
+                        return 'Message processing failed',500
+    except Exception as e:
+        print('Error procesando webhook:',str(e)[:500],flush=True)
+        return 'Webhook processing failed',500
     return 'EVENT_RECEIVED',200
 
 @app.get('/dashboard/export.csv')
 def export_csv():
     if not authorized(request): return login()
-    c=db(); rows=c.execute('SELECT id,sender,direction,body,created_at FROM messages ORDER BY id').fetchall(); c.close()
-    buf=io.StringIO(); writer=csv.writer(buf); writer.writerow(['ID','Cliente','Dirección','Mensaje','Fecha y hora'])
-    for r in rows: writer.writerow([r['id'],r['sender'],'Entrante' if r['direction']=='in' else 'Saliente',r['body'],r['created_at']])
+    c=db(); rows=c.execute('SELECT id,sender,direction,body,created_at,delivery_status,delivery_error FROM messages ORDER BY id').fetchall(); c.close()
+    buf=io.StringIO(); writer=csv.writer(buf); writer.writerow(['ID','Cliente','Dirección','Mensaje','Fecha y hora','Estado de envío','Detalle de fallo'])
+    for r in rows: writer.writerow([r['id'],r['sender'],'Entrante' if r['direction']=='in' else 'Saliente',r['body'],r['created_at'],r['delivery_status'],r['delivery_error']])
     data='\\ufeff'+buf.getvalue()
     return Response(data, mimetype='text/csv; charset=utf-8', headers={'Content-Disposition':'attachment; filename=dt_gruas_respaldo_conversaciones.csv'})
 
@@ -587,6 +704,7 @@ def prospects_csv():
 @app.route('/dashboard/prospects', methods=['GET','POST'])
 def prospects_dashboard():
     if not authorized(request): return login()
+    if request.method=='POST' and not same_origin_dashboard_post(request): return Response('Origen no permitido',403)
     if request.method=='POST':
         pid=request.form.get('id',''); status=request.form.get('status','').strip()
         if pid and status:
@@ -608,6 +726,7 @@ CONTENT_STATUSES = ('Borrador', 'Pendiente de aprobación', 'Aprobado', 'Publica
 def content_dashboard():
     """Supervised content workspace; stores/previews copy only, never publishes."""
     if not authorized(request): return login()
+    if request.method=='POST' and not same_origin_dashboard_post(request): return Response('Origen no permitido',403)
     now = datetime.now(timezone.utc).isoformat()
     if request.method == 'POST':
         action, item_id = request.form.get('action', 'save'), request.form.get('id', '').strip()
@@ -690,6 +809,7 @@ def media(attachment_id):
 @app.route('/dashboard/<sender>',methods=['GET','POST'])
 def chat(sender):
     if not authorized(request): return login()
+    if request.method=='POST' and not same_origin_dashboard_post(request): return Response('Origen no permitido',403)
     if request.method=='POST':
         if request.form.get('status'):
             set_status(sender,request.form.get('status'))
@@ -707,13 +827,22 @@ def chat(sender):
             audio.save(stored)
             send_audio(sender, str(stored), filename)
         return redirect('/dashboard/'+sender)
-    c=db(); rows=c.execute('SELECT direction,body,created_at FROM messages WHERE sender=? ORDER BY id',(sender,)).fetchall(); attachments=c.execute('SELECT id,type,filename,status,created_at FROM attachments WHERE sender=? ORDER BY created_at',(sender,)).fetchall(); c.close()
+    c=db(); rows=c.execute('SELECT direction,body,created_at,delivery_status,delivery_error FROM messages WHERE sender=? ORDER BY id',(sender,)).fetchall(); attachments=c.execute('SELECT id,type,filename,status,created_at FROM attachments WHERE sender=? ORDER BY created_at',(sender,)).fetchall(); c.close()
     safe_sender=html.escape(sender)
     current_status=html.escape(get_status(sender))
     options=''.join(f'<option {"selected" if x==current_status else ""}>{x}</option>' for x in ('Nuevo','Contactado','Cotización pendiente','Servicio contratado','Cerrado'))
     quick=''.join('<form method="post" style="display:inline"><input type="hidden" name="text" value="'+html.escape(msg,quote=True)+'"><button type="submit">'+html.escape(label)+'</button></form>' for label,msg in QUICK_REPLIES)
     out=[f'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat</title><style>body{{font-family:Arial;margin:24px;max-width:800px}}.in,.out{{padding:10px;margin:8px;border-radius:8px;white-space:pre-wrap}}.in{{background:#eee}}.out{{background:#d9fdd3;text-align:right}}textarea{{width:80%;height:55px}}button{{padding:12px}}.btn{{display:inline-block;background:#075e9b;color:white;padding:10px 14px;border-radius:6px;text-decoration:none;margin:8px 0}}.quick{{background:#f4f6f8;padding:10px;border-radius:8px;margin:10px 0}}</style><a href="/dashboard">← Conversaciones</a><h2>{safe_sender}</h2><form method="post">Estado: <select name="status">{options}</select> <button>Guardar estado</button></form><a class="btn" href="/dashboard/stats">📊 Estadísticas</a> <a class="btn" href="/dashboard/print">🖨️ Imprimir / Guardar PDF</a><div class="quick"><b>Respuestas rápidas:</b><br>{quick}</div>']
-    for r in rows: out.append(f'<div class="{r["direction"]}"><small>{html.escape(format_dt(r["created_at"]))}</small><br>{html.escape(r["body"])}</div>')
+    for r in rows:
+        delivery=''
+        if r['direction']=='out':
+            state=r['delivery_status'] or 'recorded'
+            labels={'pending':'Pendiente','accepted_by_meta':'Aceptado por Meta (no confirma entrega)','failed':'Fallido','recorded':'Estado anterior no verificado'}
+            delivery='<br><small>Estado: '+html.escape(labels.get(state,state))
+            if state=='failed' and r['delivery_error']:
+                delivery+=' · '+html.escape(r['delivery_error'][:300])
+            delivery+='</small>'
+        out.append(f'<div class="{r["direction"]}"><small>{html.escape(format_dt(r["created_at"]))}</small><br>{html.escape(r["body"])}{delivery}</div>')
     if attachments:
         out.append('<div class="quick"><b>Archivos recibidos:</b><ul>')
         for a in attachments:
