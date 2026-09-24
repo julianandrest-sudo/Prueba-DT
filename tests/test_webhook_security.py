@@ -32,6 +32,19 @@ class WebhookSecurityTests(unittest.TestCase):
         signature = hmac.new(b'test-meta-secret', body, hashlib.sha256).hexdigest()
         return {'Content-Type': 'application/json', 'X-Hub-Signature-256': 'sha256=' + signature}
 
+    def test_postgres_query_without_params_preserves_like_wildcards(self):
+        calls = []
+        class Cursor:
+            def execute(self, *args):
+                calls.append(args)
+        connection = object.__new__(app_module.PGConnection)
+        connection.cur = Cursor()
+        query = "SELECT body FROM messages WHERE body LIKE '%grúa%'"
+        connection.execute(query)
+        connection.execute('SELECT id FROM messages WHERE sender=?', ('573001234567',))
+        self.assertEqual(calls[0], (query,))
+        self.assertEqual(calls[1], ('SELECT id FROM messages WHERE sender=%s', ('573001234567',)))
+
     def test_signature_validation(self):
         body = b'{"entry":[]}'
         sig = 'sha256=' + hmac.new(b'test-meta-secret', body, hashlib.sha256).hexdigest()
