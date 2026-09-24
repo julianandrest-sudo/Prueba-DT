@@ -102,7 +102,12 @@ class PGConnection:
         self.conn=psycopg2.connect(url, connect_timeout=10)
         self.cur=self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     def execute(self, query, params=()):
-        self.cur.execute(query.replace('?', '%s'), params)
+        query=query.replace('?', '%s')
+        if params:
+            self.cur.execute(query, params)
+        else:
+            # Passing an empty tuple makes psycopg2 treat literal % in LIKE patterns as placeholders.
+            self.cur.execute(query)
         return self.cur
     def commit(self): self.conn.commit()
     def close(self): self.cur.close(); self.conn.close()
